@@ -1,11 +1,25 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+
+vi.mock("../../open-sse/shared/mimoAccount.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    // Keep region helpers real; pin cookie resolution so unit tests never SSO.
+    getMimoAccountCookie: vi.fn(async () => null),
+  };
+});
+
 import { XiaomiMimoExecutor, __test__ } from "../../open-sse/executors/xiaomi-mimo.js";
 import { getExecutor } from "../../open-sse/executors/index.js";
 
-const { bareModel, COOKIE_KEY } = __test__;
+const { bareModel, COOKIE_KEY, BASE_KEY, ACCOUNT_ROUTE_MODELS } = __test__;
 
 const OPENAI_T = { runtimeTransport: { format: "openai", baseUrl: "https://api.xiaomimimo.com/v1/chat/completions" } };
 const CLAUDE_T = { runtimeTransport: { format: "claude", baseUrl: "https://api.xiaomimimo.com/anthropic/v1/messages" } };
+
+// Pin region so assertions do not depend on the host's Desktop apm-region.json.
+const CN_CRED = { providerSpecificData: { mimoRegion: "cn" } };
+const SGP_CRED = { providerSpecificData: { mimoRegion: "sgp" } };
 
 describe("xiaomi-mimo executor", () => {
   let ex;
@@ -17,12 +31,34 @@ describe("xiaomi-mimo executor", () => {
     expect(getExecutor("xiaomi-mimo")).toBeInstanceOf(XiaomiMimoExecutor);
   });
 
-  it("routes Preview models to the account-service route regardless of transport", () => {
-    const expected = "https://mimo-server-cn.xiaomimimo.com/api/route/chat/completions";
-    expect(ex.buildUrl("mimo-x-pro-preview", true, 0, OPENAI_T)).toBe(expected);
-    expect(ex.buildUrl("mimo-x-pro-preview", true, 0, CLAUDE_T)).toBe(expected);
+  it("treats Desktop subscription aliases as account-route models", () => {
+    for (const id of ["mimo-auto", "mimo-flash", "mimo-pro", "mimo-x-pro-preview", "mimo-x-flash-preview"]) {
+      expect(ACCOUNT_ROUTE_MODELS.has(id)).toBe(true);
+      expect(XiaomiMimoExecutor.isAccountRouteModel(id)).toBe(true);
+    }
+    expect(XiaomiMimoExecutor.isAccountRouteModel("mimo-v2.5-pro")).toBe(false);
+  });
+
+  it("routes Preview models to the region account-service route", () => {
+    expect(ex.buildUrl("mimo-x-pro-preview", true, 0, { ...OPENAI_T, ...CN_CRED })).toBe(
+      "https://mimo-server-cn.xiaomimimo.com/api/route/chat/completions",
+    );
+    expect(ex.buildUrl("mimo-x-pro-preview", true, 0, { ...CLAUDE_T, ...SGP_CRED })).toBe(
+      "https://mimo-server-sgp.xiaomimimo.com/api/route/chat/completions",
+    );
     // body.model arrives as `xiaomi/<id>` via upstreamModelId
-    expect(ex.buildUrl("xiaomi/mimo-x-flash-preview", true, 0, OPENAI_T)).toBe(expected);
+    expect(ex.buildUrl("xiaomi/mimo-x-flash-preview", true, 0, { ...OPENAI_T, ...CN_CRED })).toBe(
+      "https://mimo-server-cn.xiaomimimo.com/api/route/chat/completions",
+    );
+  });
+
+  it("routes subscription aliases to the same account-service route", () => {
+    expect(ex.buildUrl("mimo-auto", true, 0, { ...OPENAI_T, ...SGP_CRED })).toBe(
+      "https://mimo-server-sgp.xiaomimimo.com/api/route/chat/completions",
+    );
+    expect(ex.buildUrl("mimo-pro", true, 0, { ...OPENAI_T, ...SGP_CRED })).toBe(
+      "https://mimo-server-sgp.xiaomimimo.com/api/route/chat/completions",
+    );
   });
 
   it("keeps the sourceFormat-matched endpoint for cloud models", () => {
@@ -65,6 +101,13 @@ describe("xiaomi-mimo executor", () => {
     expect(out.temperature).toBe(0.2);       // caller's value kept
     expect(out.top_p).toBe(0.95);            // default filled in
     expect(out.max_tokens).toBe(4096);
+  });
+
+  it("does not stamp Preview defaults onto subscription aliases", () => {
+    const out = ex.transformRequest("mimo-auto", { messages: [{ role: "user", content: "hi" }] }, true, {});
+    expect(out.thinking).toBeUndefined();
+    expect(out.max_tokens).toBeUndefined();
+    expect(out.temperature).toBeUndefined();
   });
 
   it("leaves cloud bodies free of Preview defaults", () => {

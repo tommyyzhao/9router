@@ -1,3 +1,11 @@
+# Unreleased
+
+## Fixes
+- **Xiaomi MiMo**: align Desktop account-session glue with MiMo Desktop 26.x — multi-path cookie discovery (`Xiaomi MiMo AI/Partitions/xiaomi-account/Cookies`), region-aware `mimo-server-{sgp,ru,in,cn}` hosts from `apm-region.json` / connection override, passToken-only auto-import when `auth.json` is absent
+
+## Features
+- **Xiaomi MiMo**: add Desktop harness subscription tiles `mimo-auto` / `mimo-flash` / `mimo-pro` (cookie route), TTS voice clone/design, and `X-Mimo-Source: mimocode-cli` on cloud transports
+
 # v0.5.75 (2026-09-10)
 
 ## Features

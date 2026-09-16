@@ -5,13 +5,16 @@ import crypto from "node:crypto";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 
 /**
- * Xiaomi MiMo account-session helpers (used for weekly quota).
+ * Xiaomi MiMo account-session helpers (Desktop harness parity).
  *
- * The weekly quota endpoint lives on the account service domain and is authorized
- * by an account session cookie, NOT the sk- API key. Acquiring that cookie mirrors
- * MiMo Desktop: a passToken (persisted in Desktop's cookie store) is exchanged via
- * the passportapi SSO, then authorized for the `mimopc` service, and finally stamped
- * by the mimo-server /api/sts callback into a `serviceToken` cookie.
+ * Weekly quota, Desktop-exclusive Preview models, and subscription aliases
+ * (mimo-auto / mimo-flash / mimo-pro) live on the account service and are
+ * authorized by an account session cookie, NOT the sk- API key.
+ *
+ * Acquiring that cookie mirrors MiMo Desktop: a passToken (persisted in
+ * Desktop's Chromium cookie store) is exchanged via passportapi SSO, then
+ * authorized for the `mimopc` service, and finally stamped by the mimo-server
+ * /api/sts callback into a `serviceToken` cookie.
  *
  * Flow (verified against MiMo Desktop traffic):
  *   1. GET  {api}/api/user/xiaomi/me           -> 302 to account SSO (sid=mimopc)
@@ -19,40 +22,141 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
  *   3. GET  {location}&clientSign=...          -> account-level serviceToken
  *   4. GET  account /pass/serviceLogin?sid=mimopc&callback=<sts>&_json=true
  *   5. GET  {api}/api/sts?...&ticket...        -> Set-Cookie: serviceToken (mimopc scope)
+ *
+ * Region: Desktop picks mimo-server-<region> (sgp/ru/in; cn for domestic).
+ * This host's Desktop is SGP — hardcoding CN breaks overseas Preview + quota.
  */
 
-const API_BASE = "https://mimo-server-cn.xiaomimimo.com";
 const ACCOUNT_HOST = "account.xiaomi.com";
 const API_UA =
   "miNative PC/Normal Windows_NT/10.0.19045 SDKV/1.0.0 DEVT/PC DEVS/Windows APP/miaccount_desktop APPV/0.1.0";
 const SSO_UA = "MiClaw/1.0";
 const COOKIE_TTL_MS = 30 * 60 * 1000;
 
+/** Overseas account-service hosts from the Desktop engine (asar). */
+const ACCOUNT_HOSTS = {
+  sgp: "mimo-server-sgp.xiaomimimo.com",
+  ru: "mimo-server-ru.xiaomimimo.com",
+  in: "mimo-server-in.xiaomimimo.com",
+  // Domestic edition — explicit override; not in the overseas host map.
+  cn: "mimo-server-cn.xiaomimimo.com",
+};
+
+const DEFAULT_REGION = "sgp";
+
 // Per-account session caches (keyed by passToken hash) so multiple Xiaomi
 // accounts / connections can rotate without clobbering each other.
 const _cache = new Map(); // key -> { cookie, at }
 const _inflight = new Map(); // key -> Promise<cookie|null>
 
-function desktopCookiePath() {
-  const home = os.homedir();
+function homeDir() {
+  return process.env.HOME || process.env.USERPROFILE || os.homedir();
+}
+
+function userDataRoots() {
+  const home = homeDir();
   if (process.platform === "win32") {
-    return path.join(home, "AppData", "Roaming", "Xiaomi MiMo", "Partitions", "xiaomi-account", "Network", "Cookies");
+    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+    return [
+      path.join(appData, "Xiaomi MiMo AI"),
+      path.join(appData, "Xiaomi MiMo"),
+    ];
   }
   if (process.platform === "darwin") {
-    return path.join(home, "Library", "Application Support", "Xiaomi MiMo", "Partitions", "xiaomi-account", "Network", "Cookies");
+    return [
+      path.join(home, "Library", "Application Support", "Xiaomi MiMo AI"),
+      path.join(home, "Library", "Application Support", "Xiaomi MiMo"),
+    ];
   }
-  return path.join(home, ".config", "Xiaomi MiMo", "Partitions", "xiaomi-account", "Network", "Cookies");
+  const xdg = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
+  return [
+    path.join(xdg, "Xiaomi MiMo AI"),
+    path.join(xdg, "Xiaomi MiMo"),
+  ];
 }
 
 /**
- * Read the persisted Xiaomi account cookies from MiMo Desktop's Electron profile.
- * The Chromium cookie DB is held with an exclusive lock while Desktop runs, so we
- * copy it first and bail (return null) if that fails.
- * @returns {Promise<Record<string,string>|null>}
+ * Ordered candidate cookie DB paths. Current Desktop (26.912.x) stores cookies
+ * at Partitions/xiaomi-account/Cookies — not under Network/, and the app folder
+ * is "Xiaomi MiMo AI". Keep legacy layouts as fallbacks.
+ * @returns {string[]}
  */
-async function readDesktopAccountCookies() {
-  const src = desktopCookiePath();
-  if (!fs.existsSync(src)) return null;
+export function desktopCookiePathCandidates() {
+  const out = [];
+  for (const root of userDataRoots()) {
+    out.push(path.join(root, "Partitions", "xiaomi-account", "Cookies"));
+    out.push(path.join(root, "Partitions", "xiaomi-account", "Network", "Cookies"));
+  }
+  return out;
+}
+
+/** First existing cookie DB path, or null. */
+export function desktopCookiePath() {
+  for (const p of desktopCookiePathCandidates()) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/**
+ * Normalize a region token the way Desktop does (case-insensitive).
+ * @param {unknown} raw
+ * @returns {"sgp"|"ru"|"in"|"cn"|null}
+ */
+export function normalizeMimoRegion(raw) {
+  if (typeof raw !== "string") return null;
+  const t = raw.trim().toUpperCase();
+  if (t === "CN") return "cn";
+  if (t === "IN") return "in";
+  if (t === "RU" || t === "BY" || t === "KZ") return "ru";
+  if (t === "SGP" || t === "SG") return "sgp";
+  // EU maps to the SGP overseas edition in Desktop's default path.
+  if (t === "EU") return "sgp";
+  return null;
+}
+
+/**
+ * Read Desktop's cached APM region (…/apm-region.json).
+ * @returns {string|null} lowercase region id
+ */
+export function readDesktopRegion() {
+  for (const root of userDataRoots()) {
+    try {
+      const p = path.join(root, "apm-region.json");
+      if (!fs.existsSync(p)) continue;
+      const j = JSON.parse(fs.readFileSync(p, "utf-8"));
+      const r = normalizeMimoRegion(j?.region);
+      if (r) return r;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the account-service API base (`https://mimo-server-…/api`).
+ * Priority: connection override → Desktop apm-region.json → sgp.
+ * @param {object|null} providerSpecificData
+ * @returns {string}
+ */
+export function getMimoAccountBase(providerSpecificData = null) {
+  const fromConn = normalizeMimoRegion(providerSpecificData?.mimoRegion);
+  const region = fromConn || readDesktopRegion() || DEFAULT_REGION;
+  const host = ACCOUNT_HOSTS[region] || ACCOUNT_HOSTS[DEFAULT_REGION];
+  return `https://${host}/api`;
+}
+
+/** mimo-server account API base (legacy export; prefer getMimoAccountBase). */
+export const MIMO_API_BASE = `https://${ACCOUNT_HOSTS[DEFAULT_REGION]}/api`;
+export const MIMO_API_UA = API_UA;
+
+async function readCookieJarFromPath(src) {
+  if (!src || !fs.existsSync(src)) return null;
   const tmp = path.join(os.tmpdir(), `9r-mimo-cookies-${process.pid}-${crypto.randomBytes(4).toString("hex")}.db`);
   try {
     fs.copyFileSync(src, tmp);
@@ -62,9 +166,15 @@ async function readDesktopAccountCookies() {
   try {
     const { DatabaseSync } = await import("node:sqlite");
     const db = new DatabaseSync(tmp, { readOnly: true });
-    const rows = db.prepare("SELECT name, value FROM cookies WHERE host_key = ?").all("." + ACCOUNT_HOST);
+    // Desktop writes account cookies under .account.xiaomi.com and .xiaomi.com.
+    const rows = db
+      .prepare("SELECT name, value FROM cookies WHERE host_key IN (?, ?) AND value != ''")
+      .all("." + ACCOUNT_HOST, ".xiaomi.com");
     db.close();
-    const jar = Object.fromEntries(rows.map((r) => [r.name, r.value]));
+    const jar = {};
+    for (const r of rows) {
+      if (r?.name && r?.value && !(r.name in jar)) jar[r.name] = r.value;
+    }
     return jar.passToken ? jar : null;
   } catch {
     return null;
@@ -78,16 +188,35 @@ async function readDesktopAccountCookies() {
 }
 
 /**
+ * Read the persisted Xiaomi account cookies from MiMo Desktop's Electron profile.
+ * The Chromium cookie DB is held with an exclusive lock while Desktop runs, so we
+ * copy it first and bail (return null) if that fails.
+ * @returns {Promise<Record<string,string>|null>}
+ */
+async function readDesktopAccountCookies() {
+  for (const src of desktopCookiePathCandidates()) {
+    const jar = await readCookieJarFromPath(src);
+    if (jar?.passToken) return jar;
+  }
+  return null;
+}
+
+/**
  * Read just the passToken + identity cookies from Desktop's profile.
  * Exported so the connect flow can persist a per-account passToken into the
  * connection's providerSpecificData — this is what enables multi-account rotation.
- * @returns {Promise<{passToken:string, userId:string|null, cUserId:string|null}|null>}
+ * @returns {Promise<{passToken:string, userId:string|null, cUserId:string|null, region:string|null}|null>}
  */
 export async function readDesktopPassToken() {
   try {
     const jar = await readDesktopAccountCookies();
     if (!jar?.passToken) return null;
-    return { passToken: jar.passToken, userId: jar.userId || null, cUserId: jar.cUserId || null };
+    return {
+      passToken: jar.passToken,
+      userId: jar.userId || null,
+      cUserId: jar.cUserId || null,
+      region: readDesktopRegion(),
+    };
   } catch {
     return null;
   }
@@ -116,13 +245,13 @@ function cookieHeader(jar) {
  * Exchange a passToken for a mimo-server service session cookie.
  * @returns {Promise<string|null>} Cookie header value, or null on failure.
  */
-async function acquireServiceCookie(passJar, proxyOptions) {
+async function acquireServiceCookie(passJar, apiBase, proxyOptions) {
   const jar = { ...passJar };
   const ck = () => cookieHeader(jar);
 
   // 1. Unauthenticated API call -> 302 carrying the sts callback (sid=mimopc)
   const r1 = await proxyAwareFetch(
-    `${API_BASE}/api/user/xiaomi/me`,
+    `${apiBase}/user/xiaomi/me`,
     { redirect: "manual", headers: { "User-Agent": API_UA, Cookie: ck() } },
     proxyOptions,
   );
@@ -176,7 +305,7 @@ async function acquireServiceCookie(passJar, proxyOptions) {
 
 /**
  * Get (and cache) the mimo-server account cookie.
- * @param {object|null} providerSpecificData - may carry `mimoPassToken` override
+ * @param {object|null} providerSpecificData - may carry `mimoPassToken` + `mimoRegion`
  */
 async function getServiceCookie(providerSpecificData, proxyOptions) {
   const passJar = providerSpecificData?.mimoPassToken
@@ -184,12 +313,14 @@ async function getServiceCookie(providerSpecificData, proxyOptions) {
     : await readDesktopAccountCookies();
   if (!passJar) return { cookie: null, reason: "no-pass-token" };
 
+  const apiBase = getMimoAccountBase(providerSpecificData);
+
   // One cached session per passToken — accounts/connections rotate independently.
   const key = crypto.createHash("sha256").update(passJar.passToken).digest("hex");
 
   const cached = _cache.get(key);
   if (cached && Date.now() - cached.at < COOKIE_TTL_MS) {
-    return { cookie: cached.cookie };
+    return { cookie: cached.cookie, apiBase };
   }
 
   // De-dupe concurrent handshakes for the same account: a burst of requests must
@@ -197,12 +328,12 @@ async function getServiceCookie(providerSpecificData, proxyOptions) {
   const inflight = _inflight.get(key);
   if (inflight) {
     const cookie = await inflight;
-    return cookie ? { cookie } : { cookie: null, reason: "sso-failed" };
+    return cookie ? { cookie, apiBase } : { cookie: null, reason: "sso-failed" };
   }
 
   const promise = (async () => {
     try {
-      return await acquireServiceCookie(passJar, proxyOptions);
+      return await acquireServiceCookie(passJar, apiBase, proxyOptions);
     } catch {
       return null; // network/parse failure — callers degrade, never throw
     } finally {
@@ -214,17 +345,13 @@ async function getServiceCookie(providerSpecificData, proxyOptions) {
   const cookie = await promise;
   if (!cookie) return { cookie: null, reason: "sso-failed" };
   _cache.set(key, { cookie, at: Date.now() });
-  return { cookie };
+  return { cookie, apiBase };
 }
 
 /** Drop cached sessions so the next call re-runs the handshake (e.g. after a 401). */
 export function invalidateMimoAccountCookieCache() {
   _cache.clear();
 }
-
-/** mimo-server account API base + the User-Agent its backend expects. */
-export const MIMO_API_BASE = API_BASE;
-export const MIMO_API_UA = API_UA;
 
 /**
  * Resolve the mimo-server account-session cookie, for upstream /api/route/* calls.
@@ -244,13 +371,13 @@ export async function getMimoAccountCookie(providerSpecificData = null, proxyOpt
  * @returns {Promise<{percent?:number, resetDate?:string, resetAt?:number, error?:string}>}
  */
 export async function getMimoAccountUsage(providerSpecificData = null, proxyOptions = null) {
-  const { cookie, reason } = await getServiceCookie(providerSpecificData, proxyOptions);
+  const { cookie, reason, apiBase } = await getServiceCookie(providerSpecificData, proxyOptions);
   if (!cookie) {
     return { error: reason === "no-pass-token" ? "no-session" : "session-failed" };
   }
   try {
     const res = await proxyAwareFetch(
-      `${API_BASE}/api/user/usage`,
+      `${apiBase || getMimoAccountBase(providerSpecificData)}/user/usage`,
       { headers: { "User-Agent": API_UA, Cookie: cookie, Accept: "application/json" }, signal: AbortSignal.timeout(10000) },
       proxyOptions,
     );
@@ -262,3 +389,9 @@ export async function getMimoAccountUsage(providerSpecificData = null, proxyOpti
     return { error: e.message };
   }
 }
+
+export const __test__ = {
+  ACCOUNT_HOSTS,
+  DEFAULT_REGION,
+  userDataRoots,
+};

@@ -32,7 +32,7 @@ vi.mock("@/models", () => ({
 }));
 
 vi.mock("open-sse/shared/mimoAccount.js", () => ({
-  readDesktopPassToken: vi.fn(async () => ({ passToken: "pt-abc", userId: "u1", cUserId: "c1" })),
+  readDesktopPassToken: vi.fn(async () => ({ passToken: "pt-abc", userId: "u1", cUserId: "c1", region: "sgp" })),
 }));
 
 vi.mock("@/lib/oauth/utils/ideDetect", () => ({ detectIdeInstalled: vi.fn() }));
@@ -131,6 +131,7 @@ describe("xiaomi-mimo OAuth session lifecycle", () => {
     expect(arg.provider).toBe("xiaomi-mimo");
     expect(arg.providerSpecificData.mimoPassToken).toBe("pt-abc");
     expect(arg.providerSpecificData.mimoUserId).toBe("u1");
+    expect(arg.providerSpecificData.mimoRegion).toBe("sgp");
   });
 
   it("still reports unknown for an unregistered state", async () => {

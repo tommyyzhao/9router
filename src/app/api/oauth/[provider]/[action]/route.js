@@ -358,6 +358,7 @@ export async function POST(request, { params }) {
               mimoPassToken: passToken?.passToken || null,
               mimoUserId: passToken?.userId || null,
               mimoCUserId: passToken?.cUserId || null,
+              mimoRegion: passToken?.region || null,
             },
             testStatus: "active",
           });

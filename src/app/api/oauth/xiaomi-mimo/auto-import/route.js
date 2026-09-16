@@ -2,48 +2,62 @@ import { NextResponse } from "next/server";
 import { readFile, access, constants } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
-import { readDesktopPassToken } from "open-sse/shared/mimoAccount.js";
+import { readDesktopPassToken, readDesktopRegion } from "open-sse/shared/mimoAccount.js";
 
 /**
  * GET /api/oauth/xiaomi-mimo/auto-import
- * Auto-detect Xiaomi MiMo credentials from local auth.json.
+ * Auto-detect Xiaomi MiMo Desktop credentials for the harness account session.
  *
  * Sources (in priority order):
- *   1. ~/.local/share/mimocode/auth.json  → xiaomi field
- *   2. %APPDATA%/Xiaomi MiMo/...          → (future: Desktop keychain)
+ *   1. ~/.local/share/mimocode/auth.json  → xiaomi field (sk- key; older Desktop)
+ *   2. Desktop Chromium account cookies   → passToken (current Desktop 26.x)
  *
- * auth.json shape:
- * {
- *   "xiaomi": {
- *     "type": "api",
- *     "key": "sk-xxxx",
- *     "metadata": { "uid": "...", "base_url": "https://api.xiaomimimo.com/v1" }
- *   }
- * }
+ * Current Desktop (Xiaomi MiMo AI) often has NO auth.json — login is cookie-based.
+ * PassToken-only is a valid connect: Preview + mimo-auto/flash/pro + weekly quota
+ * work without an sk- key; cloud models still need a key or platform OAuth.
  */
 
-function getCandidatePaths() {
+function getCandidateAuthPaths() {
   const home = homedir();
   const paths = [];
 
   // MiMoCode / MiMo Desktop shared data dir (cross-platform XDG)
   paths.push(join(home, ".local", "share", "mimocode", "auth.json"));
 
-  // Windows: also check USERPROFILE-based XDG
   if (process.platform === "win32") {
     const appData = process.env.APPDATA || join(home, "AppData", "Roaming");
-    // Desktop's own storage (may have separate credentials in the future)
+    paths.push(join(appData, "Xiaomi MiMo AI", "auth.json"));
     paths.push(join(appData, "Xiaomi MiMo", "auth.json"));
   }
 
-  // macOS
   if (process.platform === "darwin") {
-    paths.push(
-      join(home, "Library", "Application Support", "mimocode", "auth.json"),
-    );
+    paths.push(join(home, "Library", "Application Support", "mimocode", "auth.json"));
   }
 
   return paths;
+}
+
+async function readAuthJson() {
+  const candidates = getCandidateAuthPaths();
+  for (const candidate of candidates) {
+    try {
+      await access(candidate, constants.R_OK);
+      const raw = await readFile(candidate, "utf-8");
+      const auth = JSON.parse(raw);
+      const xiaomi = auth?.xiaomi;
+      if (xiaomi?.key) {
+        return {
+          path: candidate,
+          key: String(xiaomi.key).trim(),
+          uid: xiaomi.metadata?.uid || null,
+          baseUrl: xiaomi.metadata?.base_url || "https://api.xiaomimimo.com/v1",
+        };
+      }
+    } catch {
+      // try next
+    }
+  }
+  return null;
 }
 
 /**
@@ -51,61 +65,8 @@ function getCandidatePaths() {
  */
 export async function GET() {
   try {
-    const candidates = getCandidatePaths();
+    const auth = await readAuthJson();
 
-    let authPath = null;
-    for (const candidate of candidates) {
-      try {
-        await access(candidate, constants.R_OK);
-        authPath = candidate;
-        break;
-      } catch {
-        // Try next candidate
-      }
-    }
-
-    if (!authPath) {
-      return NextResponse.json({
-        found: false,
-        error: `Xiaomi MiMo Desktop auth file not found. Checked:\n${candidates.join("\n")}\n\nMake sure Xiaomi MiMo Desktop is installed and you are signed in.`,
-      });
-    }
-
-    const raw = await readFile(authPath, "utf-8");
-    let auth;
-    try {
-      auth = JSON.parse(raw);
-    } catch {
-      return NextResponse.json({
-        found: false,
-        error: "auth.json is not valid JSON. Please sign in to Xiaomi MiMo Desktop again.",
-      });
-    }
-
-    const xiaomi = auth?.xiaomi;
-    if (!xiaomi || !xiaomi.key) {
-      return NextResponse.json({
-        found: false,
-        error: "No Xiaomi credentials found in auth.json. Please sign in to Xiaomi MiMo Desktop.",
-      });
-    }
-
-    // Validate key format
-    const key = String(xiaomi.key).trim();
-    if (!key.startsWith("sk-")) {
-      return NextResponse.json({
-        found: false,
-        error: "Xiaomi key does not appear to be a valid API key (expected sk- prefix).",
-      });
-    }
-
-    const metadata = xiaomi.metadata || {};
-    const uid = metadata.uid || null;
-    const baseUrl = metadata.base_url || "https://api.xiaomimimo.com/v1";
-
-    // Account-session passToken from Desktop's cookie store. Persisting it per
-    // connection is what lets multiple Xiaomi accounts rotate independently.
-    // (null while Desktop is running — its cookie DB is exclusively locked.)
     let mimoPassToken = null;
     let mimoUserId = null;
     let mimoCUserId = null;
@@ -120,15 +81,34 @@ export async function GET() {
       console.log("[xiaomi-mimo] passToken read failed (non-fatal):", e.message);
     }
 
+    const region = readDesktopRegion();
+
+    const hasKey = !!(auth && auth.key.startsWith("sk-"));
+    const hasSession = !!mimoPassToken;
+
+    if (!hasKey && !hasSession) {
+      return NextResponse.json({
+        found: false,
+        region,
+        error:
+          "No Xiaomi MiMo Desktop credentials found. Sign in to MiMo Desktop (account session) and/or add an sk- API key.",
+      });
+    }
+
     return NextResponse.json({
       found: true,
-      apiKey: key,
-      uid,
-      baseUrl,
-      source: authPath,
+      // sk- is optional: cookie-only Desktop login is enough for account-route models.
+      apiKey: hasKey ? auth.key : null,
+      uid: auth?.uid || mimoUserId || null,
+      baseUrl: auth?.baseUrl || "https://api.xiaomimimo.com/v1",
+      source: hasKey ? auth.path : "desktop-account-cookie",
+      hasApiKey: hasKey,
+      hasAccountSession: hasSession,
       mimoPassToken,
       mimoUserId,
       mimoCUserId,
+      mimoRegion: region,
+      region,
     });
   } catch (error) {
     console.log("Xiaomi MiMo auto-import error:", error);
