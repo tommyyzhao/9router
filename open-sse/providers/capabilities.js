@@ -34,6 +34,7 @@
 
 import { matchPattern } from "./pricing.js";
 import { looksLikeVisionModel } from "./visionPatterns.js";
+import { isMuseSparkModel } from "./models/helpers.js";
 
 /**
  * Safe floor — every resolved result is merged over this so consumers
@@ -53,7 +54,7 @@ export const DEFAULT_CAPABILITIES = {
   tools: true,          // function / tool calling
   reasoning: false,     // thinking / reasoning
   // thinking wire format (only meaningful when reasoning:true). null → derive from transport.format.
-  // enum: openai|claude-adaptive|claude-budget|gemini-level|gemini-budget|zai|qwen|deepseek|kimi|minimax|hunyuan|step
+  // enum: openai|claude-adaptive|claude-budget|gemini-level|gemini-budget|zai|qwen|deepseek|kimi|minimax|hunyuan|step|meta
   thinkingFormat: null,
   thinkingCanDisable: true,  // false → model cannot turn thinking off (clamp to min instead of disable)
   thinkingRange: null,       // { min, max } for budget formats; null = no clamp
@@ -143,7 +144,25 @@ const CODEX_GPT_56_DEFAULT_CAPS = { vision: true, reasoning: true, search: true,
 /**
  * Provider-specific capability overrides. Keyed by provider alias/id.
  */
+const META_SPARK_CAPS = {
+  vision: true,
+  pdf: true,
+  videoInput: true,
+  reasoning: true,
+  thinkingFormat: "meta",
+  thinkingCanDisable: false,
+  contextWindow: 1048576,
+  maxOutput: 131072,
+};
+
 export const PROVIDER_CAPABILITIES = {
+  meta: {
+    "muse-spark-1.3-contributor": META_SPARK_CAPS,
+    "muse-spark-1.3": META_SPARK_CAPS,
+    "muse-spark-1.2-contributor": META_SPARK_CAPS,
+    "muse-spark-1.2": META_SPARK_CAPS,
+    "muse-spark-1.1": META_SPARK_CAPS,
+  },
   // NVIDIA NIM is OpenAI-compatible → rejects MiniMax/GLM native `thinking` field.
   // Force openai reasoning_effort format for its reasoning models. #issue
   "nvidia": {
@@ -461,6 +480,11 @@ export function getCapabilitiesForModel(provider, model) {
     const providerCaps = PROVIDER_CAPABILITIES[provider];
     if (providerCaps?.[model]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[model] };
     if (providerCaps?.[baseModel]) return { ...DEFAULT_CAPABILITIES, ...providerCaps[baseModel] };
+    // Muse Spark dash/paren suffixes and live-catalog ids share one Meta format.
+    if ((provider === "meta" || provider === "muse" || provider === "muse-code" || provider === "meta-ai")
+      && isMuseSparkModel(baseModel)) {
+      return { ...DEFAULT_CAPABILITIES, ...(providerCaps?.[baseModel] || META_SPARK_CAPS) };
+    }
   }
 
   // 2. Canonical exact

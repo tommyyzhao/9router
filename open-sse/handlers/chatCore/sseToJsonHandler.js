@@ -182,6 +182,49 @@ export function parseSSEToOpenAIResponse(rawSSE, fallbackModel) {
 export async function handleForcedSSEToJson({ providerResponse, sourceFormat, targetFormat, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, customToolNames, trackDone, appendLog, reqTag, log }) {
   const contentType = providerResponse.headers.get("content-type") || "";
   const isSSE = contentType.includes("text/event-stream") || (contentType === "" && isResponsesProvider(provider));
+  const isJson = contentType.includes("application/json");
+  // Muse Spark (and some store=false Responses backends) may ignore Accept: sse
+  // and return a completed JSON object. Consume it here instead of piping JSON
+  // through the SSE transform (which synthesizes response.failed).
+  if (!isSSE && isJson && isResponsesProvider(provider)) {
+    try {
+      const jsonResponse = await providerResponse.json();
+      if (onRequestSuccess) await onRequestSuccess();
+      const usage = jsonResponse.usage || {};
+      appendLog({ tokens: usage, status: "200 OK" });
+      saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, silent: true });
+      if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime } }));
+      const { textContent } = pickAssistantMessageForChatCompletion(jsonResponse.output);
+      const totalLatency = Date.now() - requestStartTime;
+      saveRequestDetail(buildRequestDetail({
+        provider, model, connectionId,
+        request: extractRequestConfig(body, stream),
+        providerRequest: finalBody || translatedBody || null,
+        latency: { ttft: totalLatency, total: totalLatency },
+        tokens: { prompt_tokens: usage.input_tokens || 0, completion_tokens: usage.output_tokens || 0 },
+        response: { content: textContent, thinking: null, finish_reason: jsonResponse.status || "unknown" },
+        status: "success"
+      }, { endpoint: clientRawRequest?.endpoint || null })).catch(() => {});
+      if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
+        return { success: true, response: new Response(JSON.stringify(jsonResponse), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+      }
+      const inTokens = usage.input_tokens || 0;
+      const outTokens = usage.output_tokens || 0;
+      const message = { role: "assistant", content: textContent || "" };
+      const finalResp = {
+        id: jsonResponse.id || `chatcmpl-${Date.now()}`,
+        object: "chat.completion",
+        created: jsonResponse.created_at || Math.floor(Date.now() / 1000),
+        model: jsonResponse.model || model,
+        choices: [{ index: 0, message, finish_reason: jsonResponse.status === "completed" ? "stop" : (jsonResponse.status || "stop") }],
+        usage: { prompt_tokens: inTokens, completion_tokens: outTokens, total_tokens: inTokens + outTokens },
+      };
+      return { success: true, response: new Response(JSON.stringify(finalResp), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+    } catch (err) {
+      console.error("[ChatCore] Responses JSON fallback failed:", err);
+      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Failed to convert JSON response");
+    }
+  }
   if (!isSSE) return null; // not handled here
 
   trackDone();

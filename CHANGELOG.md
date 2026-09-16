@@ -1,3 +1,8 @@
+# Unreleased
+
+## Features
+- **Muse Code**: add the Muse Code subscription as an OAuth provider (`meta` / `muse`). Import the local `muse login` key or sign in with device code. Routes Muse Spark through `https://api.meta.ai/v1/responses`. PAYG Model API dashboard keys are not supported.
+
 # v0.5.75 (2026-09-10)
 
 ## Features

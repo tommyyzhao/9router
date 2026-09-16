@@ -22,6 +22,7 @@ const resolved = {
     "grok-cli": PROVIDERS["grok-cli"]?.tokenUrl,
     cline: PROVIDERS.cline?.tokenUrl,
     kimi: PROVIDERS.kimi?.tokenUrl,
+    meta: PROVIDERS.meta?.tokenUrl,
   },
   authUrls: {
     iflow: PROVIDERS.iflow?.authUrl,
@@ -32,6 +33,7 @@ const resolved = {
     kimi: PROVIDERS.kimi?.refreshUrl,
     xai: PROVIDERS.xai?.refreshUrl,
     "grok-cli": PROVIDERS["grok-cli"]?.tokenUrl,
+    meta: PROVIDERS.meta?.tokenUrl,
   },
   clientIds: {
     claude: PROVIDERS.claude?.clientId,
@@ -39,6 +41,7 @@ const resolved = {
     iflow: PROVIDERS.iflow?.clientId,
     kimi: PROVIDERS.kimi?.clientId,
     "grok-cli": PROVIDERS["grok-cli"]?.clientId,
+    meta: PROVIDERS.meta?.clientId,
   },
 };
 const current = JSON.parse(JSON.stringify(resolved));

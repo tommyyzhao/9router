@@ -124,6 +124,9 @@ export const KIMCHI_CONFIG = { ...PROVIDER_OAUTH["kimchi"] };
 // Endpoint: cli-chat-proxy.grok.com — same client_id as xai, different flow + scopes
 export const GROK_CLI_CONFIG = { ...PROVIDER_OAUTH["grok-cli"] };
 
+// Muse Code subscription — device-code to auth.meta.com; inference uses the CLI-minted LLM| key.
+export const META_OAUTH_CONFIG = { ...PROVIDER_OAUTH["meta"] };
+
 // Trae (ByteDance marscode) OAuth — authorization_code flow with local callback.
 //   1) POST GetLoginGuidance {loginTraceID} → {Result.LoginHost}
 //   2) Browser opens ${loginHost}/authorization?client_id=...&login_trace_id=...&auth_callback_url=${cb}

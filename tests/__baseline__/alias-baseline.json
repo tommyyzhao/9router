@@ -116,7 +116,11 @@
     "devin": "devin",
     "devin-cli": "devin-cli",
     "morph": "morph",
-    "morphllm": "morph"
+    "morphllm": "morph",
+    "meta": "meta",
+    "meta-ai": "meta",
+    "muse": "meta",
+    "muse-code": "meta"
   },
   "idToAlias": {
     "alicode": "alicode",
@@ -166,6 +170,7 @@
     "kimi": "kimi",
     "kiro": "kr",
     "llm7": "llm7",
+    "meta": "meta",
     "mimo-free": "mmf",
     "minimax": "minimax",
     "minimax-cn": "minimax-cn",
@@ -256,6 +261,7 @@
     "kr",
     "llm7",
     "local-device",
+    "meta",
     "minimax",
     "minimax-cn",
     "mistral",

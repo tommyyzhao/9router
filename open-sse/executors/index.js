@@ -13,6 +13,7 @@ import { OpenCodeExecutor } from "./opencode.js";
 import { OpenCodeGoExecutor } from "./opencode-go.js";
 import { GrokWebExecutor } from "./grok-web.js";
 import { GrokCliExecutor } from "./grok-cli.js";
+import { MetaExecutor } from "./meta.js";
 import { PerplexityWebExecutor } from "./perplexity-web.js";
 import { OllamaLocalExecutor } from "./ollama-local.js";
 import { CommandCodeExecutor } from "./commandcode.js";
@@ -47,6 +48,10 @@ const executors = {
   "grok-cli": new GrokCliExecutor(),
   gcli: new GrokCliExecutor(), // Alias
   gb: new GrokCliExecutor(), // Alias (Grok Build)
+  meta: new MetaExecutor(),
+  muse: new MetaExecutor(),
+  "muse-code": new MetaExecutor(),
+  "meta-ai": new MetaExecutor(),
   "perplexity-web": new PerplexityWebExecutor(),
   "ollama-local": new OllamaLocalExecutor(),
   commandcode: new CommandCodeExecutor(),
@@ -91,6 +96,7 @@ export { OpenCodeExecutor } from "./opencode.js";
 export { OpenCodeGoExecutor } from "./opencode-go.js";
 export { GrokWebExecutor } from "./grok-web.js";
 export { GrokCliExecutor } from "./grok-cli.js";
+export { MetaExecutor } from "./meta.js";
 export { PerplexityWebExecutor } from "./perplexity-web.js";
 export { OllamaLocalExecutor } from "./ollama-local.js";
 export { CommandCodeExecutor } from "./commandcode.js";

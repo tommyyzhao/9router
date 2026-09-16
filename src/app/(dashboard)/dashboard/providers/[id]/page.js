@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
 import { getProviderIconSrc, markProviderIconMissing } from "@/shared/utils/providerIcon";
-import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthWrapper, CursorAuthModal, XiaomiMimoAuthModal, IFlowCookieModal, GitLabAuthModal, Toggle, Select, EditConnectionModal, NoAuthProxyCard, ConfirmModal } from "@/shared/components";
+import { Card, Button, Badge, Input, Modal, CardSkeleton, OAuthModal, KiroOAuthWrapper, CursorAuthModal, XiaomiMimoAuthModal, MetaAuthModal, IFlowCookieModal, GitLabAuthModal, Toggle, Select, EditConnectionModal, NoAuthProxyCard, ConfirmModal } from "@/shared/components";
 import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, getProviderAlias, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, AI_PROVIDERS } from "@/shared/constants/providers";
 import { getModelsByProviderId, getModelKind } from "@/shared/constants/models";
 import { getThinkingLevels } from "open-sse/providers/thinkingLevels.js";
@@ -46,6 +46,7 @@ export default function ProviderDetailPage() {
   const [proxyPools, setProxyPools] = useState([]);
   const [showOAuthModal, setShowOAuthModal] = useState(false);
   const [showXiaomiMimoModal, setShowXiaomiMimoModal] = useState(false);
+  const [showMetaAuthModal, setShowMetaAuthModal] = useState(false);
   const [showIFlowCookieModal, setShowIFlowCookieModal] = useState(false);
   const [showAddApiKeyModal, setShowAddApiKeyModal] = useState(false);
   const [addConnectionError, setAddConnectionError] = useState("");
@@ -102,6 +103,10 @@ export default function ProviderDetailPage() {
     // Xiaomi Desktop: auto-import local credentials first, OAuth as fallback
     if (providerId === "xiaomi-mimo") {
       setShowXiaomiMimoModal(true);
+      return;
+    }
+    if (providerId === "meta") {
+      setShowMetaAuthModal(true);
       return;
     }
     if (isOAuth) {
@@ -165,6 +170,7 @@ export default function ProviderDetailPage() {
   const oauthConnectionLabel =
     providerId === "xai" ? "Grok Build OAuth"
     : providerId === "grok-cli" ? "Grok CLI Device Login"
+    : providerId === "meta" ? "Muse Code Login"
     : providerId === "kimi" ? "Kimi Coding OAuth"
     : "OAuth";
   const apiKeyConnectionLabel =
@@ -1808,6 +1814,12 @@ export default function ProviderDetailPage() {
         isOpen={showXiaomiMimoModal}
         onSuccess={handleOAuthSuccess}
         onClose={() => setShowXiaomiMimoModal(false)}
+      />
+      <MetaAuthModal
+        isOpen={showMetaAuthModal}
+        providerInfo={providerInfo}
+        onSuccess={handleOAuthSuccess}
+        onClose={() => setShowMetaAuthModal(false)}
       />
       {providerId === "iflow" && (
         <IFlowCookieModal

@@ -267,6 +267,14 @@ export const PROVIDER_PRICING = {
     "z-ai/glm-5.2": { input: 1.4, output: 4.4, cached: 0.26, reasoning: 4.4 },
     "z-ai/glm-5.3-free": { input: 0, output: 0, cached: 0, reasoning: 0 },
   },
+  // Muse Code subscription — Model API list prices (Contributor trains on prompts).
+  meta: {
+    "muse-spark-1.3": { input: 1.25, output: 4.25, cached: 0.15, reasoning: 4.25 },
+    "muse-spark-1.2": { input: 1.25, output: 4.25, cached: 0.15, reasoning: 4.25 },
+    "muse-spark-1.1": { input: 1.25, output: 4.25, cached: 0.15, reasoning: 4.25 },
+    "muse-spark-1.3-contributor": { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20 },
+    "muse-spark-1.2-contributor": { input: 0.10, output: 0.20, cached: 0.002, reasoning: 0.20 },
+  },
 };
 
 /**

@@ -146,3 +146,35 @@ describe("forced-SSE JSON path for a Responses-API client behind a chat upstream
     expect(json.choices[0].message.tool_calls[0].function.name).toBe("shell");
   });
 });
+
+describe("forceStream provider that returns JSON instead of SSE", () => {
+  it("returns the Responses JSON body to a Responses client", async () => {
+    const payload = {
+      id: "resp_json",
+      object: "response",
+      status: "completed",
+      model: "muse-spark-1.3-contributor",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "PONG" }] }],
+      usage: { input_tokens: 3, output_tokens: 1, total_tokens: 4 },
+    };
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } }),
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "meta",
+      model: "muse-spark-1.3-contributor",
+      body: { model: "muse-spark-1.3-contributor", stream: false },
+      stream: true,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/responses" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.object).toBe("response");
+    expect(json.status).toBe("completed");
+    expect(json.output[0].content[0].text).toBe("PONG");
+  });
+});

@@ -6,6 +6,7 @@ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
+import { stripCallerBoundReasoning } from "../utils/callerBoundReasoning.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
@@ -302,7 +303,10 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {
-      const result = await handleSingleModel(body, modelStr);
+      // After the first combo member, drop caller-bound encrypted reasoning so
+      // a Meta/OpenCode/Codex blob cannot 400 the next provider.
+      const attemptBody = i === 0 ? body : stripCallerBoundReasoning(body);
+      const result = await handleSingleModel(attemptBody, modelStr);
       
       // Success (2xx) - return response
       if (result.ok) {
