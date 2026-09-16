@@ -17,6 +17,10 @@ const ACCOUNT_ROUTE_MODELS = new Set([
   "mimo-pro",
 ]);
 
+// Desktop maps the public `mimo-auto` alias onto flash (or pro). The account
+// route rejects a literal `mimo-auto` on some regions (chat_model_not_public).
+const AUTO_ALIAS_UPSTREAM = "mimo-x-flash-preview";
+
 // Session cookie resolved in execute() (async) and read back by buildHeaders()
 // (sync — BaseExecutor.execute does not await it). Carried on the per-request
 // credentials object, same as runtimeTransport.
@@ -78,13 +82,17 @@ export class XiaomiMimoExecutor extends DefaultExecutor {
 
     // Preview models: thinking/params get defaults only — never override what the
     // caller set explicitly. (body.model is already `xiaomi/<id>` via upstreamModelId.)
-    // Subscription aliases (mimo-auto/flash/pro) stay untouched — Desktop sends them as-is.
+    // Subscription aliases (mimo-flash/pro) stay untouched — Desktop sends them as-is.
     const bare = bareModel(model);
     if (bare === "mimo-x-pro-preview" || bare === "mimo-x-flash-preview") {
       if (out.thinking == null) out.thinking = { type: "enabled" };
       if (out.temperature == null) out.temperature = 1.0;
       if (out.top_p == null) out.top_p = 0.95;
       if (!out.max_tokens) out.max_tokens = 4096;
+    }
+    // `mimo-auto` is a client-facing alias; upstream wants a concrete tile.
+    if (bare === "mimo-auto" || out.model === "mimo-auto" || out.model === "xiaomi/mimo-auto") {
+      out.model = `xiaomi/${AUTO_ALIAS_UPSTREAM}`;
     }
 
     return out;
