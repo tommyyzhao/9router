@@ -140,7 +140,11 @@ describe("Xiaomi MiMo TTS", () => {
     expect(getTtsAdapter("xiaomi-mimo")).toBeTruthy();
 
     const ttsModels = PROVIDER_MODELS["xiaomi-mimo"].filter((m) => (m.kind || m.type) === "tts").map((m) => m.id);
-    expect(ttsModels).toEqual(["mimo-v2.5-tts"]);
+    expect(ttsModels).toEqual([
+      "mimo-v2.5-tts",
+      "mimo-v2.5-tts-voiceclone",
+      "mimo-v2.5-tts-voicedesign",
+    ]);
 
     expect(TTS_PROVIDER_CONFIG["xiaomi-mimo"].hasStyleInput).toBe(true);
     expect(TTS_PROVIDER_CONFIG["xiaomi-mimo"].hasLanguageHint).toBe(true);

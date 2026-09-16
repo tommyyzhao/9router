@@ -35,7 +35,7 @@ export default function XiaomiMimoAuthModal({ isOpen, onSuccess, onClose }) {
         const data = await res.json();
         if (cancelled) return;
 
-        if (data.found && data.apiKey) {
+        if (data.found && (data.apiKey || data.mimoPassToken)) {
           setDetectResult(data);
           setPhase("found");
         } else {
@@ -55,7 +55,7 @@ export default function XiaomiMimoAuthModal({ isOpen, onSuccess, onClose }) {
 
   // Import the auto-detected key
   const handleImport = async () => {
-    if (!detectResult?.apiKey) return;
+    if (!detectResult?.apiKey && !detectResult?.mimoPassToken) return;
     setPhase("importing");
     setError(null);
 
@@ -64,12 +64,13 @@ export default function XiaomiMimoAuthModal({ isOpen, onSuccess, onClose }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          apiKey: detectResult.apiKey,
+          apiKey: detectResult.apiKey || null,
           uid: detectResult.uid,
           baseUrl: detectResult.baseUrl,
           mimoPassToken: detectResult.mimoPassToken || null,
           mimoUserId: detectResult.mimoUserId || null,
           mimoCUserId: detectResult.mimoCUserId || null,
+          mimoRegion: detectResult.mimoRegion || detectResult.region || null,
         }),
       });
       const data = await res.json();
@@ -150,7 +151,7 @@ export default function XiaomiMimoAuthModal({ isOpen, onSuccess, onClose }) {
             </div>
             <h3 className="text-lg font-semibold mb-2">Reading local credentials...</h3>
             <p className="text-sm text-text-muted">
-              Checking ~/.local/share/mimocode/auth.json
+              Checking Desktop auth.json and account session cookies
             </p>
           </div>
         )}
@@ -164,7 +165,16 @@ export default function XiaomiMimoAuthModal({ isOpen, onSuccess, onClose }) {
                 <div className="text-sm text-green-800 dark:text-green-200">
                   <p className="font-medium">Xiaomi MiMo Desktop credentials found!</p>
                   <p className="mt-1 opacity-80">
-                    UID: {detectResult.uid || "—"} · Source: {detectResult.source?.split(/[\\/]/).pop()}
+                    UID: {detectResult.uid || "—"} ·{" "}
+                    {detectResult.hasApiKey && detectResult.hasAccountSession
+                      ? "API key + Desktop session"
+                      : detectResult.hasApiKey
+                        ? "API key"
+                        : "Desktop account session"}
+                    {detectResult.region ? ` · ${String(detectResult.region).toUpperCase()}` : ""}
+                  </p>
+                  <p className="mt-1 opacity-70 text-xs">
+                    Source: {detectResult.source?.split(/[\\/]/).pop()}
                   </p>
                 </div>
               </div>
@@ -225,7 +235,7 @@ export default function XiaomiMimoAuthModal({ isOpen, onSuccess, onClose }) {
                     fetch("/api/oauth/xiaomi-mimo/auto-import")
                       .then((r) => r.json())
                       .then((data) => {
-                        if (data.found && data.apiKey) {
+                        if (data.found && (data.apiKey || data.mimoPassToken)) {
                           setDetectResult(data);
                           setPhase("found");
                         } else {
