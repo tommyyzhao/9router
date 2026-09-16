@@ -17,11 +17,14 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
  * /api/sts callback into a `serviceToken` cookie.
  *
  * Flow (verified against MiMo Desktop traffic):
- *   1. GET  {api}/api/user/xiaomi/me           -> 302 to account SSO (sid=mimopc)
+ *   1. GET  {api}/api/user/xiaomi/me           -> 302 carrying callback + region sid
  *   2. GET  account /pass/serviceLogin?sid=passportapi&_json=true   -> nonce/ssecurity
  *   3. GET  {location}&clientSign=...          -> account-level serviceToken
- *   4. GET  account /pass/serviceLogin?sid=mimopc&callback=<sts>&_json=true
- *   5. GET  {api}/api/sts?...&ticket...        -> Set-Cookie: serviceToken (mimopc scope)
+ *   4. GET  account /pass/serviceLogin?sid=<region>&callback=<sts>&_json=true
+ *   5. GET  {api}/api/sts?...&ticket...        -> Set-Cookie: serviceToken
+ *
+ * Sid is region-specific (mimopc / mimosgp / …) and is taken from the step-1
+ * redirect — hardcoding mimopc fails overseas (this host is SGP).
  *
  * Region: Desktop picks mimo-server-<region> (sgp/ru/in; cn for domestic).
  * This host's Desktop is SGP — hardcoding CN breaks overseas Preview + quota.
@@ -249,7 +252,8 @@ async function acquireServiceCookie(passJar, apiBase, proxyOptions) {
   const jar = { ...passJar };
   const ck = () => cookieHeader(jar);
 
-  // 1. Unauthenticated API call -> 302 carrying the sts callback (sid=mimopc)
+  // 1. Unauthenticated API call -> 302 carrying the sts callback + region sid
+  //    (sid is region-specific: mimopc / mimosgp / … — never hardcode it).
   const r1 = await proxyAwareFetch(
     `${apiBase}/user/xiaomi/me`,
     { redirect: "manual", headers: { "User-Agent": API_UA, Cookie: ck() } },
@@ -257,7 +261,9 @@ async function acquireServiceCookie(passJar, apiBase, proxyOptions) {
   );
   const redirect = r1.headers.get("location");
   if (!redirect) return null;
-  const stsCallback = new URL(redirect).searchParams.get("callback");
+  const redirectUrl = new URL(redirect);
+  const stsCallback = redirectUrl.searchParams.get("callback");
+  const sid = redirectUrl.searchParams.get("sid") || "mimopc";
   if (!stsCallback) return null;
 
   // 2. passportapi SSO phase 1 -> nonce + ssecurity
@@ -278,9 +284,9 @@ async function acquireServiceCookie(passJar, apiBase, proxyOptions) {
   );
   absorbSetCookie(jar, sso2);
 
-  // 4. mimopc SSO -> sts callback carrying a ticket
+  // 4. region SSO (sid from step 1) -> sts callback carrying a ticket
   const sso3 = await proxyAwareFetch(
-    `https://${ACCOUNT_HOST}/pass/serviceLogin?sid=mimopc&callback=${encodeURIComponent(stsCallback)}&_json=true`,
+    `https://${ACCOUNT_HOST}/pass/serviceLogin?sid=${encodeURIComponent(sid)}&callback=${encodeURIComponent(stsCallback)}&_json=true`,
     { headers: { Cookie: ck(), "User-Agent": SSO_UA, Accept: "application/json" } },
     proxyOptions,
   );
