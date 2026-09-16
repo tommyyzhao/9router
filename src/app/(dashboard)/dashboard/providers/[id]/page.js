@@ -181,6 +181,9 @@ export default function ProviderDetailPage() {
   // Resolve suffix "(level)" for a model when a thinking level is picked and the model supports it.
   const resolveThinkingSuffix = (modelId) => {
     if (!thinkingMode || thinkingMode === "auto") return null;
+    // Dash effort aliases (grok-4.5-high, gpt-5-codex-high, …) already encode a
+    // level. Do not also stamp `(high)` from the provider Thinking picker.
+    if (/(?:-|_)(minimal|low|medium|high|xhigh|max)$/i.test(String(modelId || ""))) return null;
     const levels = getThinkingLevels(providerId, modelId);
     return levels && levels.includes(thinkingMode) ? thinkingMode : null;
   };
