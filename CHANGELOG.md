@@ -1,3 +1,8 @@
+# Unreleased
+
+## Features
+- **Grok CLI**: add Grok 4.6 (and high/medium/low effort aliases) to the Grok Build catalog; forward `reasoning.effort` for `grok-4.6` the same way as `grok-4.5` (#3514)
+
 # v0.5.75 (2026-09-10)
 
 ## Features

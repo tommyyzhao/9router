@@ -58,6 +58,13 @@ describe("grok-cli registry", () => {
     expect(getModelUpstreamId("gcli", "grok-4.5-low")).toBe("grok-4.5");
     expect(getModelUpstreamId("gcli", "grok-4.5")).toBe("grok-4.5");
   });
+
+  it("maps effort virtual models to upstream grok-4.6", () => {
+    expect(getModelUpstreamId("gcli", "grok-4.6-high")).toBe("grok-4.6");
+    expect(getModelUpstreamId("gcli", "grok-4.6-medium")).toBe("grok-4.6");
+    expect(getModelUpstreamId("gcli", "grok-4.6-low")).toBe("grok-4.6");
+    expect(getModelUpstreamId("gcli", "grok-4.6")).toBe("grok-4.6");
+  });
 });
 
 describe("GrokCliExecutor", () => {
@@ -320,6 +327,26 @@ describe("GrokCliExecutor", () => {
       reasoning: { effort: "max", summary: "detailed" },
     }, true, { connectionId: "effort-conn" });
     expect(out.reasoning).toEqual({ effort: "xhigh", summary: "detailed" });
+  });
+
+  it("forwards reasoning effort for grok-4.6 (#3514)", () => {
+    expect(supportsGrokCliReasoningEffort("grok-4.6")).toBe(true);
+    expect(supportsGrokCliReasoningEffort("grok-4.6-xhigh")).toBe(true);
+
+    const out = executor.transformRequest("grok-4.6-xhigh", {
+      model: "grok-4.6-xhigh",
+      input: "hi",
+    }, true, { connectionId: "g46-effort" });
+    expect(out.model).toBe("grok-4.6");
+    expect(out.reasoning).toEqual({ effort: "xhigh", summary: "concise" });
+  });
+
+  it("keeps the allowlist closed around grok-4.5 / grok-4.6", () => {
+    expect(supportsGrokCliReasoningEffort("grok-4.5")).toBe(true);
+    expect(supportsGrokCliReasoningEffort("grok-4.6")).toBe(true);
+    expect(supportsGrokCliReasoningEffort("grok-4.7")).toBe(false);
+    expect(supportsGrokCliReasoningEffort("grok-build")).toBe(false);
+    expect(supportsGrokCliReasoningEffort("grok-composer-2.5-fast")).toBe(false);
   });
 
   it("omits reasoning effort for models that reject it", () => {
