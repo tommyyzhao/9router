@@ -2,6 +2,7 @@
 
 ## Features
 - **Muse Code**: add the Muse Code subscription as an OAuth provider (`meta` / `muse`). Import the local `muse login` key or sign in with device code. Routes Muse Spark through `https://api.meta.ai/v1/responses`. PAYG Model API dashboard keys are not supported.
+- **Grok CLI**: add Grok 4.6 (and high/medium/low effort aliases) to the Grok Build catalog; forward `reasoning.effort` for `grok-4.6` the same way as `grok-4.5` (#3514)
 
 # v0.5.75 (2026-09-10)
 
