@@ -1,7 +1,7 @@
 # Unreleased
 
 ## Features
-- **Grok CLI**: add Grok 4.6 (and high/medium/low effort aliases) to the Grok Build catalog; forward `reasoning.effort` for `grok-4.6` the same way as `grok-4.5` (#3514)
+- **Grok CLI**: add `gcli/grok-4.6` to the Grok Build catalog and forward `reasoning.effort` for it (#3514). Effort is the dashboard Thinking suffix (`grok-4.6(high)`), not extra `-high` catalog rows.
 
 # v0.5.75 (2026-09-10)
 

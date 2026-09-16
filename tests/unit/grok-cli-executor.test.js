@@ -59,10 +59,7 @@ describe("grok-cli registry", () => {
     expect(getModelUpstreamId("gcli", "grok-4.5")).toBe("grok-4.5");
   });
 
-  it("maps effort virtual models to upstream grok-4.6", () => {
-    expect(getModelUpstreamId("gcli", "grok-4.6-high")).toBe("grok-4.6");
-    expect(getModelUpstreamId("gcli", "grok-4.6-medium")).toBe("grok-4.6");
-    expect(getModelUpstreamId("gcli", "grok-4.6-low")).toBe("grok-4.6");
+  it("lists grok-4.6 as a first-class catalog id", () => {
     expect(getModelUpstreamId("gcli", "grok-4.6")).toBe("grok-4.6");
   });
 });
