@@ -19,6 +19,7 @@ import { getGroqUsage } from "./usage/groq.js";
 import { getZedUsage } from "./usage/zed.js";
 import { getXiaomiMimoUsage } from "./usage/xiaomi-mimo.js";
 import { getMistralUsage } from "./usage/mistral.js";
+import { getMetaUsage } from "./usage/meta.js";
 import { resolveQoderCredentials } from "./qoderModels.js";
 import { getGlmUsage } from "./usage/glm.js";
 import {
@@ -64,6 +65,10 @@ const USAGE_HANDLERS = {
   zed: (c) => getZedUsage(c.accessToken, c.providerSpecificData, c.proxyOptions),
   "xiaomi-mimo": (c) => getXiaomiMimoUsage(c.accessToken, c.providerSpecificData, c.proxyOptions),
   mistral: (c) => getMistralUsage(c.apiKey, c.proxyOptions),
+  meta: (c) => getMetaUsage(c.accessToken, c.proxyOptions),
+  muse: (c) => getMetaUsage(c.accessToken, c.proxyOptions),
+  "muse-code": (c) => getMetaUsage(c.accessToken, c.proxyOptions),
+  "meta-ai": (c) => getMetaUsage(c.accessToken, c.proxyOptions),
 };
 
 export async function getUsageForProvider(connection, proxyOptions = null, options = {}) {

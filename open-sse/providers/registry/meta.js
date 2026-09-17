@@ -62,5 +62,8 @@ export default {
     refreshUrl: "https://auth.meta.com/oidc/device/token/",
   },
   modelsFetcher: { url: "https://api.meta.ai/muse-code/models", type: "openai" },
+  features: {
+    usage: true,
+  },
   serviceKinds: ["llm"],
 };
