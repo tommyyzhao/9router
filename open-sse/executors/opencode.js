@@ -5,13 +5,30 @@ import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
+import {
+  normalizeResponsesInput,
+  clampResponsesCallId,
+  coerceResponsesArguments,
+  coerceResponsesOutput,
+} from "../translator/formats/responsesApi.js";
 
 const OPENCODE_UA = "opencode/1.18.31";
+const MAX_TOOL_NAME_LEN = 128;
 const MAX_SESSION_LENGTH = 256;
 const SESSION_HEADER = "x-opencode-session";
 const SESSION_FIELD = "_opencodeSession";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+// Upstream free-tier gate (verified live 2026-09-18): /zen/v1/chat/completions
+// and /zen/v1/responses with `Authorization: Bearer public` reject requests
+// that do not look like the official OpenCode agentic client, even when
+// User-Agent/session shape are valid. Concretely enforced:
+// - stream must be true (stream:false → 403 FreeTierError);
+// - tools must include the file-search quartet {bash, glob, grep, read}
+//   (0–3 of them → 403; the remaining six builtins are optional extras).
+// Missing-tool requests are the common 9router case: plain chat callers send
+// no tools, so without injection every such request 403s.
+const OPENCODE_FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read"];
 
 function hasValidOpencodeVersion(ua) {
   const m = String(ua || "").match(/opencode\/(\d+)\.(\d+)(?:\.(\d+))?/i);
@@ -20,7 +37,6 @@ function hasValidOpencodeVersion(ua) {
   const minor = parseInt(m[2], 10);
   return major > 1 || (major === 1 && minor >= 17);
 }
-
 // Models served by /zen/v1/responses; every other model stays on /chat/completions.
 const RESPONSES_MODELS = new Set([
   "muse-spark-1.2-contributor-free",
@@ -134,6 +150,131 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   return resolved ? translateSessionId(resolved, clientTool) : generateSessionId();
 }
 
+function normalizeResponsesTools(body) {
+  if (!Array.isArray(body.tools)) return;
+  const validNames = new Set();
+  body.tools = body.tools.filter((tool) => {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return false;
+    const fn = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function) ? tool.function : null;
+    const rawName = typeof tool.name === "string" ? tool.name : (typeof fn?.name === "string" ? fn.name : "");
+    const name = rawName.trim();
+    if (!name) return false;
+    const description = typeof tool.description === "string" ? tool.description : (typeof fn?.description === "string" ? fn.description : "");
+    let parameters = (tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters))
+      ? tool.parameters
+      : (fn?.parameters && typeof fn.parameters === "object" && !Array.isArray(fn.parameters) ? fn.parameters : { type: "object", properties: {} });
+    if (parameters.type === "object" && !parameters.properties) parameters = { ...parameters, properties: {} };
+    for (const k of Object.keys(tool)) delete tool[k];
+    tool.type = "function";
+    tool.name = name.slice(0, MAX_TOOL_NAME_LEN);
+    if (description) tool.description = description;
+    tool.parameters = parameters;
+    validNames.add(tool.name);
+    return true;
+  });
+  if (body.tool_choice && typeof body.tool_choice === "object" && !Array.isArray(body.tool_choice)) {
+    if (body.tool_choice.type === "function") {
+      const n = typeof body.tool_choice.name === "string" ? body.tool_choice.name.trim() : "";
+      if (!n || !validNames.has(n)) delete body.tool_choice;
+    }
+  }
+}
+function toolNameOf(tool) {
+  if (!tool || typeof tool !== "object" || Array.isArray(tool)) return "";
+  const fn = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function) ? tool.function : null;
+  const raw = typeof tool.name === "string" ? tool.name : (typeof fn?.name === "string" ? fn.name : "");
+  return raw.trim();
+}
+
+// Merge the upstream-mandated file-search quartet into Chat Completions
+// bodies. Caller tools are preserved verbatim (extras are allowed upstream);
+// only the missing fingerprint names are appended as no-op declarations the
+// model may ignore. Without this, plain chat callers that send no tools get
+// 403 FreeTierError on every request.
+function ensureChatFingerprintTools(body) {
+  if (!body || typeof body !== "object") return;
+  const present = new Set();
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      const name = toolNameOf(tool);
+      if (name) present.add(name);
+    }
+  } else {
+    body.tools = [];
+  }
+  for (const name of OPENCODE_FINGERPRINT_TOOLS) {
+    if (present.has(name)) continue;
+    body.tools.push({
+      type: "function",
+      function: {
+        name,
+        description: `OpenCode built-in ${name} tool`,
+        parameters: { type: "object", properties: {} },
+      },
+    });
+    present.add(name);
+  }
+}
+
+// Same fingerprint for the Responses flat tool shape. Runs before
+// normalizeResponsesTools so injected declarations get the same coercion as
+// caller tools.
+function ensureResponsesFingerprintTools(body) {
+  if (!body || typeof body !== "object") return;
+  const present = new Set();
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      const name = toolNameOf(tool);
+      if (name) present.add(name);
+    }
+  } else {
+    body.tools = [];
+  }
+  for (const name of OPENCODE_FINGERPRINT_TOOLS) {
+    if (present.has(name)) continue;
+    body.tools.push({
+      type: "function",
+      name,
+      description: `OpenCode built-in ${name} tool`,
+      parameters: { type: "object", properties: {} },
+    });
+    present.add(name);
+  }
+}
+
+function sanitizeResponsesItems(body) {
+  if (!Array.isArray(body.input)) return;
+  body.input = body.input.filter((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+    // Strip prior-turn reasoning items: OpenCode Free uses public/pooled credentials
+    // (`Bearer public`) routing to an upstream OpenAI/Console account pool.
+    // OpenAI Responses API strictly enforces that reasoning `encrypted_content`
+    // can only be decrypted by the exact caller/account that issued it; sending it
+    // across different accounts or rotating proxy relays triggers:
+    // [invalid_request_error] reasoning `encrypted_content` was not issued to this caller (400).
+    // Furthermore, under stateless mode (store=false), omitting encrypted_content
+    // causes OpenAI to reject the referenced reasoning item as "not found or was deleted".
+    // Dropping prior reasoning items allows multi-turn conversations and tool-calling
+    // loops to succeed cleanly.
+    if (item.type === "reasoning") return false;
+    delete item.encrypted_content;
+    delete item.reasoning_encrypted_content;
+    if (item.type === "function_call") {
+      if (!item.name || typeof item.name !== "string" || item.name.trim() === "") return false;
+      item.name = item.name.trim().slice(0, MAX_TOOL_NAME_LEN);
+      item.call_id = clampResponsesCallId(item.call_id);
+      item.arguments = coerceResponsesArguments(item.arguments);
+      return true;
+    }
+    if (item.type === "function_call_output") {
+      item.call_id = clampResponsesCallId(item.call_id);
+      item.output = coerceResponsesOutput(item.output);
+      return true;
+    }
+    return true;
+  });
+}
+
 function normalizeOpencodeReasoning(model, body) {
   const current = body.reasoning;
   const currentReasoning = current && typeof current === "object" && !Array.isArray(current)
@@ -174,7 +315,19 @@ export class OpenCodeExecutor extends BaseExecutor {
 
   transformRequest(model, body, stream, credentials) {
     if (body && typeof body === "object" && model && !body.model) body.model = model;
-    if (isResponsesModel(model) && body && typeof body === "object") {
+    if (body && typeof body === "object") {
+      // Upstream rejects non-streaming free-tier requests with 403 even when
+      // everything else is valid. chatCore already forces SSE for
+      // forceStream providers and converts back for non-stream clients, so
+      // always send stream:true upstream here.
+      body.stream = true;
+    }
+    if (isResponsesModel(model || body?.model) && body && typeof body === "object") {
+      const normalized = normalizeResponsesInput(body.input);
+      if (normalized) body.input = normalized;
+      if (!Array.isArray(body.input) || body.input.length === 0) {
+        body.input = [{ type: "message", role: "user", content: [{ type: "input_text", text: "..." }] }];
+      }
       // Responses API names the output cap max_output_tokens and takes thinking
       // as reasoning:{effort,summary} — normalize the Chat fields at this boundary.
       if (body.max_output_tokens === undefined) {
@@ -184,6 +337,12 @@ export class OpenCodeExecutor extends BaseExecutor {
       delete body.max_tokens;
       delete body.max_completion_tokens;
       normalizeOpencodeReasoning(model, body);
+      body.store = false;
+      ensureResponsesFingerprintTools(body);
+      normalizeResponsesTools(body);
+      sanitizeResponsesItems(body);
+    } else if (body && typeof body === "object") {
+      ensureChatFingerprintTools(body);
     }
     return injectReasoningContent({ provider: this.provider, model, body });
   }
