@@ -333,6 +333,46 @@ export async function getUsageHistory(filter = {}) {
   }));
 }
 
+/**
+ * Rolling local spend for one connection (quota cards without upstream %).
+ * Returns { requests, promptTokens, completionTokens, cost } for 7d and 30d.
+ */
+export async function getLocalSpendForConnection(connectionId, { days = 30 } = {}) {
+  const db = await getAdapter();
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const sevenAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const row = db.get(
+    `SELECT
+       COUNT(*) AS requests,
+       COALESCE(SUM(promptTokens), 0) AS promptTokens,
+       COALESCE(SUM(completionTokens), 0) AS completionTokens,
+       COALESCE(SUM(cost), 0) AS cost
+     FROM usageHistory
+     WHERE connectionId = ? AND timestamp >= ?`,
+    [connectionId, since],
+  );
+  const row7 = db.get(
+    `SELECT
+       COUNT(*) AS requests,
+       COALESCE(SUM(promptTokens), 0) AS promptTokens,
+       COALESCE(SUM(completionTokens), 0) AS completionTokens,
+       COALESCE(SUM(cost), 0) AS cost
+     FROM usageHistory
+     WHERE connectionId = ? AND timestamp >= ?`,
+    [connectionId, sevenAgo],
+  );
+
+  const pack = (r) => ({
+    requests: Number(r?.requests) || 0,
+    promptTokens: Number(r?.promptTokens) || 0,
+    completionTokens: Number(r?.completionTokens) || 0,
+    cost: Number(r?.cost) || 0,
+  });
+
+  return { d7: pack(row7), d30: pack(row) };
+}
+
 function loadDaysInRange(adapter, maxDays) {
   if (maxDays == null) {
     return adapter.all(`SELECT dateKey, data FROM usageDaily`);
