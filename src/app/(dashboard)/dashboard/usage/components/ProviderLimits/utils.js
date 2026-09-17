@@ -661,6 +661,23 @@ export function parseQuotaData(provider, data) {
         }
         break;
 
+      case "meta":
+      case "mistral":
+        // Local-spend rows: used counts with unlimited=true (no upstream %).
+        if (data.quotas) {
+          Object.entries(data.quotas).forEach(([name, quota]) => {
+            normalizedQuotas.push({
+              name,
+              used: quota.used || 0,
+              total: quota.total || 0,
+              resetAt: quota.resetAt || null,
+              remainingPercentage: quota.remainingPercentage,
+              unlimited: quota.unlimited === true,
+            });
+          });
+        }
+        break;
+
       default:
         // Generic fallback for unknown providers
         if (data.quotas) {
