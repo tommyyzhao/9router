@@ -389,7 +389,10 @@ export const PATTERN_CAPABILITIES = [
   { pattern: "*llama-4*",       caps: { vision: true, contextWindow: 1000000 } },
   { pattern: "*llama*",         caps: { contextWindow: 128000 } },
 
-  // ── Mistral (Large 3 = vision/256K; codestral text) ──────────────
+  // ── Mistral (Vibe CLI = vision/200K; Large 3 = vision/256K; codestral text) ──
+  { pattern: "*mistral-vibe*",  caps: { vision: true, contextWindow: 200000, maxOutput: 65536 } },
+  { pattern: "*devstral*",      caps: { vision: true, contextWindow: 200000, maxOutput: 65536 } },
+  { pattern: "*mistral-medium*",caps: { vision: true, contextWindow: 256000 } },
   { pattern: "*codestral*",     caps: { contextWindow: 256000 } },
   { pattern: "*mistral-large*", caps: { vision: true, contextWindow: 256000 } },
   { pattern: "*mistral*",       caps: { contextWindow: 128000 } },

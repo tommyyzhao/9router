@@ -1,6 +1,7 @@
 # Unreleased
 
 ## Features
+- **Mistral**: add Mistral Vibe CLI catalog (`mistral-vibe-cli-latest` / `-fast` / `-with-tools`, `devstral-small-latest`) plus Medium 3.5 / Small / Magistral rows, thinking levels, and capabilities for Vibe/Devstral/Medium
 - **Muse Code**: add the Muse Code subscription as an OAuth provider (`meta` / `muse`). Import the local `muse login` key or sign in with device code. Routes Muse Spark through `https://api.meta.ai/v1/responses`. PAYG Model API dashboard keys are not supported.
 - **Grok CLI**: add `gcli/grok-4.6` to the Grok Build catalog and forward `reasoning.effort` for it (#3514). Effort is the dashboard Thinking suffix (`grok-4.6(high)`), not extra `-high` catalog rows.
 - **Xiaomi MiMo**: add Desktop harness subscription tiles `mimo-auto` / `mimo-flash` / `mimo-pro` (cookie route), TTS voice clone/design, and `X-Mimo-Source: mimocode-cli` on cloud transports
