@@ -130,6 +130,13 @@ export const MODEL_PRICING = {
   // === Grok ===
   "grok-code-fast-1":             { input: 0.50,  output: 2.00,  cached: 0.25,  reasoning: 3.00,   cache_creation: 0.50  },
 
+  // === Mistral / Vibe CLI ===
+  "mistral-vibe-cli-latest":      { input: 1.50,  output: 7.50,  cached: 0.15,  reasoning: 7.50,   cache_creation: 1.50  },
+  "mistral-vibe-cli-fast":        { input: 0.10,  output: 0.30,  cached: 0.01,  reasoning: 0.30,   cache_creation: 0.10  },
+  "mistral-vibe-cli-with-tools":  { input: 1.50,  output: 7.50,  cached: 0.15,  reasoning: 7.50,   cache_creation: 1.50  },
+  "devstral-small-latest":        { input: 0.10,  output: 0.30,  cached: 0.01,  reasoning: 0.30,   cache_creation: 0.10  },
+  "mistral-medium-3-5":           { input: 1.50,  output: 7.50,  cached: 0.15,  reasoning: 7.50,   cache_creation: 1.50  },
+
   // === OpenRouter fallback ===
   "auto":                         { input: 2.00,  output: 8.00,  cached: 1.00,  reasoning: 12.00,  cache_creation: 2.00  },
 
