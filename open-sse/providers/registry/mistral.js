@@ -70,6 +70,10 @@ export default {
     { id: "magistral-small-latest", name: "Magistral Small", contextLength: 40000 },
     { id: "mistral-embed", name: "Mistral Embed", kind: "embedding" },
   ],
+  features: {
+    usage: true,
+    usageApikey: true,
+  },
   serviceKinds: ["llm", "imageToText", "embedding"],
   embeddingConfig: {
     baseUrl: "https://api.mistral.ai/v1/embeddings",
