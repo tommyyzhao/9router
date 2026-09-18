@@ -15,10 +15,13 @@ import {
   KIRO_CONFIG,
   CLAUDE_CONFIG,
   CLINE_CONFIG,
+  CLINEPASS_CONFIG,
   KILOCODE_CONFIG,
   KIMCHI_CONFIG,
 } from "@/lib/oauth/constants/oauth";
 import { buildClineHeaders } from "@/shared/utils/clineAuth";
+
+const CLINE_FAMILY = new Set(["cline", "clinepass"]);
 
 // OAuth provider test endpoints
 const OAUTH_TEST_CONFIG = {
@@ -84,6 +87,10 @@ const OAUTH_TEST_CONFIG = {
     authPrefix: "Bearer ",
   },
   cline: { refreshable: true },
+  // ClinePass shares the Cline/Cline API user probe. Without this entry the
+  // OAuth test falls through to "Provider test not supported" even though
+  // inference on cline-pass/* models already works.
+  clinepass: { refreshable: true },
   gitlab: {
     // Test by hitting the GitLab user API — requires api or read_user scope
     url: "https://gitlab.com/api/v4/user",
@@ -284,8 +291,11 @@ async function refreshOAuthToken(connection) {
       return { accessToken: data.accessToken, expiresIn: data.expiresIn || 3600, refreshToken: data.refreshToken || refreshToken };
     }
 
-    if (provider === "cline") {
-      const response = await fetch(CLINE_CONFIG.refreshUrl, {
+    if (CLINE_FAMILY.has(provider)) {
+      const refreshUrl = provider === "clinepass"
+        ? (CLINEPASS_CONFIG?.refreshUrl || CLINE_CONFIG.refreshUrl)
+        : CLINE_CONFIG.refreshUrl;
+      const response = await fetch(refreshUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({
@@ -367,7 +377,7 @@ async function testOAuthConnection(connection, effectiveProxy = null) {
     return { valid: false, error: initial.error, refreshed };
   }
 
-  if (connection.provider === "cline") {
+  if (CLINE_FAMILY.has(connection.provider)) {
     const tryProbe = async (token) => {
       const res = await probeClineAccessToken(token);
       if (res.ok) return { valid: true, error: null, refreshed, newTokens };
