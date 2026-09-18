@@ -22,6 +22,7 @@ import { getMistralUsage } from "./usage/mistral.js";
 import { getMetaUsage } from "./usage/meta.js";
 import { resolveQoderCredentials } from "./qoderModels.js";
 import { getGlmUsage } from "./usage/glm.js";
+import { getCommandCodeUsage } from "./usage/commandcode.js";
 import {
   getIflowUsage,
   getOllamaUsage,
@@ -69,6 +70,7 @@ const USAGE_HANDLERS = {
   muse: (c) => getMetaUsage(c.accessToken, c.proxyOptions),
   "muse-code": (c) => getMetaUsage(c.accessToken, c.proxyOptions),
   "meta-ai": (c) => getMetaUsage(c.accessToken, c.proxyOptions),
+  commandcode: (c) => getCommandCodeUsage(c.apiKey, c.proxyOptions),
 };
 
 export async function getUsageForProvider(connection, proxyOptions = null, options = {}) {
