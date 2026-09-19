@@ -124,6 +124,7 @@ import p120 from "./fish-audio.js";
 import p121 from "./alitp-intl.js";
 import p122 from "./xquik.js";
 import p124 from "./meta.js";
+import p125 from "./parallel.js";
 export default [
   p0,
   p1,
@@ -247,5 +248,7 @@ export default [
   p120,
   p121,
   p122,
+  // p123 lives mid-list (ollama-search) — do not re-append here
   p124,
+  p125,
 ];
