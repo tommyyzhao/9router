@@ -1,7 +1,7 @@
 /**
  * Search Provider Request Builders
  *
- * Builds HTTP request `{ url, init }` for 10 search providers.
+ * Builds HTTP request `{ url, init }` for 11 search providers.
  *
  * @typedef {Object} SearchProviderConfig
  * @property {string} id

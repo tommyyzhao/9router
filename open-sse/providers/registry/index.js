@@ -247,6 +247,6 @@ export default [
   p120,
   p121,
   p122,
-  p123,
+  // p123 lives mid-list (ollama-search) — do not re-append here
   p124,
 ];
