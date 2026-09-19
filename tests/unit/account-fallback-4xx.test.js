@@ -29,6 +29,18 @@ describe("checkFallbackError — request-scoped vs account-scoped failures", () 
     expect(checkFallbackError(422, "quota exceeded").shouldFallback).toBe(true);
   });
 
+  it("falls back on extra_forbidden schema rejects without cooling the account", () => {
+    const storeReject = JSON.stringify({
+      error: {
+        message: "[422]: {\"object\":\"error\",\"detail\":[{\"type\":\"extra_forbidden\",\"loc\":[\"body\",\"store\"],\"msg\":\"Extra inputs are not permitted\",\"input\":false}]}",
+        type: "invalid_request_error",
+      },
+    });
+    const result = checkFallbackError(422, storeReject);
+    expect(result.shouldFallback).toBe(true);
+    expect(result.cooldownMs).toBe(0);
+  });
+
   it("keeps the transient cooldown for unmatched server errors", () => {
     const result = checkFallbackError(503, "upstream exploded");
 

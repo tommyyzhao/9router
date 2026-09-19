@@ -66,6 +66,11 @@ export const ERROR_RULES = [
   { text: "quota exceeded",           backoff: true },
   { text: "capacity",                 backoff: true },
   { text: "overloaded",               backoff: true },
+  // Schema mismatch on one OpenAI-compatible hop (e.g. mistral-vibe rejecting
+  // client `store`). Not an account health signal — try the next combo member
+  // without cooling the current credential (cooldown 0).
+  { text: "extra_forbidden",          cooldownMs: 0 },
+  { text: "extra inputs are not permitted", cooldownMs: 0 },
 
   // --- Status-based rules (fallback when text doesn't match) ---
   { status: 401, cooldownMs: COOLDOWN.long },
