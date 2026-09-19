@@ -1,4 +1,4 @@
-// Web Fetch handler — dispatches to firecrawl, jina-reader, tavily, exa, ollama
+// Web Fetch handler — dispatches to firecrawl, jina-reader, tavily, exa, parallel, ollama
 // Returns normalized shape across all providers
 
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -116,6 +116,9 @@ export async function handleFetchCore({ url, format, maxCharacters, provider, pr
     }
     if (provider === "exa") {
       return await runExa({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQuery, startedAt });
+    }
+    if (provider === "parallel") {
+      return await runParallel({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQuery, startedAt, baseUrl: providerConfig?.baseUrl });
     }
     if (provider === "ollama") {
       return await runOllama({
@@ -251,6 +254,55 @@ async function runExa({ url, fmt, timeoutMs, apiKey, maxCharacters, costPerQuery
     success: true,
     data: buildData({
       provider: "exa", url, title: first.title || null, format: fmt, text,
+      costUsd: costPerQuery, responseMs: Date.now() - startedAt, upstreamMs
+    })
+  };
+}
+
+async function runParallel({ url, timeoutMs, apiKey, maxCharacters, costPerQuery, startedAt, baseUrl }) {
+  const upstreamStart = Date.now();
+  const extractUrl = (baseUrl || "https://api.parallel.ai/v1/extract").replace(/\/+$/, "");
+  const r = await tryFetch(extractUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(apiKey ? { "x-api-key": apiKey } : {})
+    },
+    body: JSON.stringify({
+      urls: [url],
+      advanced_settings: {
+        full_content: maxCharacters && maxCharacters > 0
+          ? { max_chars_per_result: maxCharacters }
+          : true
+      }
+    })
+  }, timeoutMs);
+
+  if (!r.ok) {
+    return { success: false, status: r.timeout ? 504 : 502, error: r.error };
+  }
+  const upstreamMs = Date.now() - upstreamStart;
+  const { json } = await readJsonOrText(r.res);
+  if (!r.res.ok) {
+    return { success: false, status: r.res.status, error: json?.error?.message || json?.error || `Parallel error: ${r.res.status}` };
+  }
+  const first = json?.results?.[0];
+  if (!first) {
+    const upstreamError = json?.errors?.[0];
+    return {
+      success: false,
+      status: 502,
+      error: upstreamError?.content || upstreamError?.error_type || "Parallel extract returned no results"
+    };
+  }
+  const excerpts = Array.isArray(first.excerpts) ? first.excerpts.filter((e) => typeof e === "string") : [];
+  const text = truncate(first.full_content || excerpts.join("\n\n") || "", maxCharacters);
+  return {
+    success: true,
+    data: buildData({
+      provider: "parallel", url, title: first.title || null,
+      // Parallel Extract always returns markdown
+      format: "markdown", text,
       costUsd: costPerQuery, responseMs: Date.now() - startedAt, upstreamMs
     })
   };

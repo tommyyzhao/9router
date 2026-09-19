@@ -172,6 +172,73 @@ function buildExaRequest(config, params) {
   };
 }
 
+const PARALLEL_MODES = new Set(["turbo", "fast", "basic", "advanced"]);
+
+/** Map 9router time_range to Parallel source_policy.after_date (YYYY-MM-DD). */
+function parallelAfterDate(timeRange) {
+  if (!timeRange || timeRange === "any") return undefined;
+  const from = new Date();
+  if (timeRange === "day") from.setUTCDate(from.getUTCDate() - 1);
+  else if (timeRange === "week") from.setUTCDate(from.getUTCDate() - 7);
+  else if (timeRange === "month") from.setUTCMonth(from.getUTCMonth() - 1);
+  else if (timeRange === "year") from.setUTCFullYear(from.getUTCFullYear() - 1);
+  else return undefined;
+  return from.toISOString().slice(0, 10);
+}
+
+function buildParallelRequest(config, params) {
+  const { includes, excludes } = parseDomainFilter(params.domainFilter);
+  const requestedMode = getProviderSetting(params, "mode");
+  const mode = requestedMode && PARALLEL_MODES.has(requestedMode) ? requestedMode : "fast";
+  const objective =
+    getProviderSetting(params, "objective") ||
+    (params.searchType === "news"
+      ? `Recent news about: ${params.query}`
+      : params.query);
+
+  const body = {
+    search_queries: [params.query],
+    objective,
+    mode,
+    advanced_settings: {
+      max_results: params.maxResults,
+    },
+  };
+
+  if (includes.length) {
+    body.advanced_settings.source_policy = { include_domains: includes };
+  } else if (excludes.length) {
+    body.advanced_settings.source_policy = { exclude_domains: excludes };
+  }
+
+  const afterDate = parallelAfterDate(params.timeRange);
+  if (afterDate) {
+    body.advanced_settings.source_policy = {
+      ...(body.advanced_settings.source_policy || {}),
+      after_date: afterDate,
+    };
+  }
+
+  if (params.country) {
+    const loc = params.country.toLowerCase();
+    body.advanced_settings.location = loc === "uk" ? "gb" : loc;
+  }
+
+  const sessionId = getProviderSetting(params, "session_id");
+  if (sessionId) body.session_id = sessionId;
+  const clientModel = getProviderSetting(params, "client_model");
+  if (clientModel) body.client_model = clientModel;
+
+  return {
+    url: resolveBaseUrl(config, params),
+    init: {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": params.token },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
 function buildTavilyRequest(config, params) {
   const { includes, excludes } = parseDomainFilter(params.domainFilter);
   const body = {
@@ -429,6 +496,7 @@ const BUILDERS = {
   "brave-search": buildBraveRequest,
   "perplexity": buildPerplexityRequest,
   "exa": buildExaRequest,
+  "parallel": buildParallelRequest,
   "tavily": buildTavilyRequest,
   "google-pse": buildGooglePseRequest,
   "linkup": buildLinkupRequest,
