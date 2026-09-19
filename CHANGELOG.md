@@ -10,6 +10,8 @@
 
 ## Fixes
 - **Xiaomi MiMo**: align Desktop account-session glue with MiMo Desktop 26.x — multi-path cookie discovery (`Xiaomi MiMo AI/Partitions/xiaomi-account/Cookies`), region-aware `mimo-server-{sgp,ru,in,cn}` hosts from `apm-region.json` / connection override, passToken-only auto-import when `auth.json` is absent
+- **Muse Code**: register `meta` in the provider connection tester (`OAUTH_TEST_CONFIG`) so Muse Code no longer returns "Provider test not supported"; probe `api.meta.ai/v1/models` with the CLI User-Agent and reject non-`LLM|` tokens with a re-import hint.
+- **ClinePass**: register `clinepass` in `OAUTH_TEST_CONFIG` and share the Cline `/api/v1/users/me` probe so Test Connection stops returning "Provider test not supported".
 
 # v0.5.81 (2026-09-18)
 
