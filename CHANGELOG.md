@@ -4,6 +4,9 @@
 - **Muse Code**: add the Muse Code subscription as an OAuth provider (`meta` / `muse`). Import the local `muse login` key or sign in with device code. Routes Muse Spark through `https://api.meta.ai/v1/responses`. PAYG Model API dashboard keys are not supported.
 - **Muse Code**: show Muse Code on the Quota Tracker as credential health + local spend (7d/30d requests/tokens/cost through 9Router). Meta does not expose 5h/weekly % over Model API HTTP for CLI-minted keys (PR-2).
 
+## Fixes
+- **Muse Code**: register `meta` in the provider connection tester (`OAUTH_TEST_CONFIG`) so Muse Code no longer returns "Provider test not supported"; probe `api.meta.ai/v1/models` with the CLI User-Agent and reject non-`LLM|` tokens with a re-import hint.
+
 # v0.5.75 (2026-09-10)
 
 ## Features

@@ -84,6 +84,21 @@ const OAUTH_TEST_CONFIG = {
     authPrefix: "Bearer ",
   },
   cline: { refreshable: true },
+  // Muse Code (Meta): OAuth connection stores a CLI-minted LLM| subscription key.
+  // Probe the Model API models list with the CLI User-Agent. Do not mark
+  // refreshable — device/CLI import stores an OIDC dca: token alongside the key,
+  // and a device-code refresh does not mint a replacement LLM| key.
+  meta: {
+    url: PROVIDERS.meta?.transport?.validateUrl || "https://api.meta.ai/v1/models",
+    method: "GET",
+    authHeader: "Authorization",
+    authPrefix: "Bearer ",
+    extraHeaders: {
+      Accept: "application/json",
+      "User-Agent": PROVIDERS.meta?.transport?.headers?.["User-Agent"] || "muse-code/1.3.0",
+    },
+    refreshable: false,
+  },
   gitlab: {
     // Test by hitting the GitLab user API — requires api or read_user scope
     url: "https://gitlab.com/api/v4/user",
@@ -322,6 +337,16 @@ async function testOAuthConnection(connection, effectiveProxy = null) {
   const config = OAUTH_TEST_CONFIG[connection.provider];
   if (!config) return { valid: false, error: "Provider test not supported", refreshed: false };
   if (!connection.accessToken) return { valid: false, error: "No access token", refreshed: false };
+
+  // Muse Code: api.meta.ai only accepts the CLI-minted Model API key (LLM|…).
+  // OIDC dca: tokens 401 — surface the same guidance as the usage handler.
+  if (connection.provider === "meta" && !String(connection.accessToken).startsWith("LLM|")) {
+    return {
+      valid: false,
+      error: "Stored token is not a Model API key (expected LLM|…). Re-import from Muse CLI.",
+      refreshed: false,
+    };
+  }
 
   // Cursor uses protobuf API - can only verify token exists, not test endpoint
   if (config.tokenExists) {
