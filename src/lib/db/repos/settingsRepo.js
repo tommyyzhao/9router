@@ -126,5 +126,9 @@ export async function getCloudUrl() {
 }
 
 export async function exportSettings() {
-  return await readRaw();
+  const settings = await readRaw();
+  // Never export gateway-local MCP secrets to cloud sync.
+  const { webMcpToken, ...rest } = settings || {};
+  void webMcpToken;
+  return rest;
 }

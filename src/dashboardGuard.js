@@ -203,6 +203,29 @@ export const __test__ = {
 export async function proxy(request) {
   const { pathname } = request.nextUrl;
 
+  // MCP routes: early short-circuit BEFORE LOCAL_ONLY_PATHS / ALWAYS_PROTECTED / generic /api/*.
+  // ALL /api/mcp/* require true loopback (custom-server peer stamp).
+  //  - /api/mcp/9router-web/* → dedicated MCP token only (not admin CLI token)
+  //  - other /api/mcp/*        → CLI token OR dashboard JWT (Cowork browsermcp etc.)
+  if (pathname.startsWith("/api/mcp/")) {
+    if (!isLocalRequest(request)) {
+      return NextResponse.json({ error: "Local only" }, { status: 403 });
+    }
+    const isWebMcp = pathname.startsWith("/api/mcp/9router-web/");
+    if (isWebMcp) {
+      const settings = await loadSettings();
+      const { hasValidWebMcpToken } = await import("@/lib/mcp/webMcpToken");
+      if (hasValidWebMcpToken(request, settings?.webMcpToken)) {
+        return NextResponse.next();
+      }
+      return NextResponse.json({ error: "Invalid MCP token" }, { status: 403 });
+    }
+    if ((await hasValidCliToken(request)) || (await isAuthenticated(request))) {
+      return NextResponse.next();
+    }
+    return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
+  }
+
   // Local-only gate for spawn-capable / host-secret routes.
   if (LOCAL_ONLY_PATHS.some((p) => pathname.startsWith(p))) {
     if (!(await canAccessLocalOnlyRoute(request))) {

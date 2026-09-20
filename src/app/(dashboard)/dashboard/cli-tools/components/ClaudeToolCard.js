@@ -56,6 +56,7 @@ export default function ClaudeToolCard({
   const [showManualConfigModal, setShowManualConfigModal] = useState(false);
   const [customBaseUrl, setCustomBaseUrl] = useState("");
   const [ccFilterNaming, setCcFilterNaming] = useState(false);
+  const [webMcpEnabled, setWebMcpEnabled] = useState(false);
   const [exaMcpEnabled, setExaMcpEnabled] = useState(false);
   const [autoCompactWindow, setAutoCompactWindow] = useState("");
   const [oneMContext, setOneMContext] = useState(false);
@@ -101,6 +102,7 @@ export default function ClaudeToolCard({
     if (initialStatus) {
       setClaudeStatus(initialStatus);
       setExaMcpEnabled(!!initialStatus.exaMcpEnabled);
+      setWebMcpEnabled(!!initialStatus.webMcpEnabled);
     }
   }, [initialStatus]);
 
@@ -179,6 +181,7 @@ export default function ClaudeToolCard({
       const data = await res.json();
       setClaudeStatus(data);
       setExaMcpEnabled(!!data.exaMcpEnabled);
+      setWebMcpEnabled(!!data.webMcpEnabled);
     } catch (error) {
       setClaudeStatus({ installed: false, error: error.message });
     } finally {
@@ -223,14 +226,14 @@ export default function ClaudeToolCard({
       const res = await fetch("/api/cli-tools/claude-settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ env, exaMcpEnabled, autoCompactWindow }),
+        body: JSON.stringify({ env, webMcpEnabled, exaMcpEnabled, autoCompactWindow }),
       });
       const data = await res.json();
       if (res.ok) {
         // Remember the endpoint so it stays selectable next time
         rememberEndpoint(getEffectiveBaseUrl(), { tunnelPublicUrl, tailscaleUrl });
         setMessage({ type: "success", text: "Settings applied successfully!" });
-        setClaudeStatus(prev => ({ ...prev, hasBackup: true, settings: { ...prev?.settings, env }, exaMcpEnabled }));
+        setClaudeStatus(prev => ({ ...prev, hasBackup: true, settings: { ...prev?.settings, env }, webMcpEnabled, exaMcpEnabled }));
       } else {
         setMessage({ type: "error", text: data.error || "Failed to apply settings" });
       }
@@ -447,14 +450,14 @@ export default function ClaudeToolCard({
                   </label>
                 </div>
 
-                {/* Exa MCP — ~/.claude.json mcpServers (not settings.json) */}
+                {/* 9Router Web MCP — primary search path via gateway combos */}
                 <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[8rem_auto_1fr_auto] sm:items-center sm:gap-2">
                   <span className="text-xs font-semibold text-text-main sm:text-right sm:text-sm">Web Search</span>
                   <span className="material-symbols-outlined hidden text-text-muted text-[14px] sm:inline">arrow_forward</span>
                   <label className="flex items-center gap-1.5 cursor-pointer select-none">
-                    <input type="checkbox" checked={exaMcpEnabled} onChange={(e) => setExaMcpEnabled(e.target.checked)} className="w-3.5 h-3.5 accent-primary cursor-pointer" />
-                    <span className="text-xs text-text-muted">Exa MCP</span>
-                    <Tooltip text="Injects Exa MCP into ~/.claude.json so non-Claude models gain web search. Restart Claude Code after Apply.">
+                    <input type="checkbox" checked={webMcpEnabled} onChange={(e) => setWebMcpEnabled(e.target.checked)} className="w-3.5 h-3.5 accent-primary cursor-pointer" />
+                    <span className="text-xs text-text-muted">9Router Web MCP</span>
+                    <Tooltip text="Injects local 9router-web MCP (search-combo / fetch-combo via Parallel-first stack). Replaces Claude built-in WebSearch/WebFetch in the model tool list. Restart Claude Code after Apply.">
                       <span className="material-symbols-outlined text-text-muted text-[14px] cursor-help">info</span>
                     </Tooltip>
                   </label>

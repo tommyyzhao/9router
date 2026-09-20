@@ -7,53 +7,149 @@ import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import { DEFAULT_PLUGINS } from "@/shared/constants/coworkPlugins";
+import { UPDATER_CONFIG } from "@/shared/constants/config";
+import { getSettings, updateSettings } from "@/lib/localDb";
+import { ensureWebMcpToken } from "@/lib/mcp/webMcpToken";
 
 const execAsync = promisify(exec);
+const WEB_MCP_NAME = "9router-web";
+const WEB_MCP_TOKEN_HEADER = "x-9r-mcp-token";
 
-// Exa MCP def — reuse from coworkPlugins (DRY).
 const EXA_PLUGIN = DEFAULT_PLUGINS.find((p) => p.name === "exa");
 const buildExaMcpEntry = () => ({
   type: EXA_PLUGIN.transport,
   url: EXA_PLUGIN.url,
 });
 
-// Get claude settings path based on OS
 const getClaudeSettingsPath = () => {
   const homeDir = os.homedir();
   return path.join(homeDir, ".claude", "settings.json");
 };
 
-// Claude Code CLI reads mcpServers from ~/.claude.json (NOT settings.json).
 const getClaudeJsonPath = () => path.join(os.homedir(), ".claude.json");
+
+/** String-aware JSONC: strip // and /* */ comments only outside string literals. */
+function stripJsoncComments(text) {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      out += c;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i + 1 < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i++;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+function stripTrailingCommas(text) {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      out += c;
+      continue;
+    }
+    if (c === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      if (text[j] === "}" || text[j] === "]") continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+function parseJsonc(text) {
+  return JSON.parse(stripTrailingCommas(stripJsoncComments(String(text))));
+}
 
 const readClaudeJson = async () => {
   try {
     const content = await fs.readFile(getClaudeJsonPath(), "utf-8");
-    return JSON.parse(content.replace(/,(\s*[}\]])/g, "$1"));
+    return parseJsonc(content);
   } catch {
     return null;
   }
 };
 
-const writeClaudeJsonMcp = async (mcpServers) => {
+/**
+ * Merge and/or remove managed MCP servers in ~/.claude.json.
+ * @param {object|null} mergeServers keys to upsert
+ * @param {string[]} removeKeys server names to delete
+ */
+const writeClaudeJsonMcp = async (mergeServers, removeKeys = []) => {
   const filePath = getClaudeJsonPath();
   let data = {};
+  let existed = false;
   try {
-    data = JSON.parse(await fs.readFile(filePath, "utf-8"));
+    const raw = await fs.readFile(filePath, "utf-8");
+    data = parseJsonc(raw);
+    existed = true;
+    if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
   } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+    if (error.code !== "ENOENT") {
+      const err = new Error(`Failed to parse ~/.claude.json: ${error.message}`);
+      err.status = 400;
+      throw err;
+    }
   }
-  if (mcpServers && Object.keys(mcpServers).length > 0) {
-    data.mcpServers = { ...(data.mcpServers || {}), ...mcpServers };
-  } else if (data.mcpServers) {
-    delete data.mcpServers.exa;
-    if (Object.keys(data.mcpServers).length === 0) delete data.mcpServers;
+
+  if (mergeServers && Object.keys(mergeServers).length > 0) {
+    data.mcpServers = { ...(data.mcpServers || {}), ...mergeServers };
   }
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2));
+  for (const key of removeKeys) {
+    if (data.mcpServers?.[key] !== undefined) delete data.mcpServers[key];
+  }
+  if (data.mcpServers && Object.keys(data.mcpServers).length === 0) delete data.mcpServers;
+
+  const payload = JSON.stringify(data, null, 2);
+  await fs.writeFile(filePath, payload, { mode: 0o600 });
+  // writeFile mode does not tighten an existing file — always chmod.
+  await fs.chmod(filePath, 0o600);
+  void existed;
 };
 
+const buildWebMcpEntry = (token) => {
+  const port = UPDATER_CONFIG.appPort || process.env.PORT || 20128;
+  return {
+    type: "sse",
+    url: `http://127.0.0.1:${port}/api/mcp/${WEB_MCP_NAME}/sse`,
+    headers: { [WEB_MCP_TOKEN_HEADER]: token },
+  };
+};
 
-// Check if claude CLI is installed (via which/where or config file exists)
 const checkClaudeInstalled = async () => {
   try {
     const isWindows = os.platform() === "win32";
@@ -73,25 +169,20 @@ const checkClaudeInstalled = async () => {
   }
 };
 
-// Read current settings
 const readSettings = async () => {
   try {
     const settingsPath = getClaudeSettingsPath();
     const content = await fs.readFile(settingsPath, "utf-8");
-    // Tolerate JSONC (trailing commas) and treat unparseable files as "no config"
-    // rather than throwing a 500 that the UI misreads as "tool not installed".
-    const stripped = content.replace(/,(\s*[}\]])/g, "$1");
-    return JSON.parse(stripped);
-  } catch (error) {
+    return parseJsonc(content);
+  } catch {
     return null;
   }
 };
 
-// GET - Check claude CLI and read current settings
 export async function GET() {
   try {
     const isInstalled = await checkClaudeInstalled();
-    
+
     if (!isInstalled) {
       return NextResponse.json({
         installed: false,
@@ -108,55 +199,42 @@ export async function GET() {
       installed: true,
       settings: settings,
       has9Router: has9Router,
+      webMcpEnabled: !!claudeJson?.mcpServers?.[WEB_MCP_NAME],
       exaMcpEnabled: !!claudeJson?.mcpServers?.exa,
       settingsPath: getClaudeSettingsPath(),
     });
   } catch (error) {
     console.log("Error checking claude settings:", error);
-    return NextResponse.json(
-      { error: "Failed to check claude settings" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Failed to check claude settings" }, { status: 500 });
   }
 }
 
-// POST - Backup old fields and write new settings
 export async function POST(request) {
   try {
-    const { env, exaMcpEnabled, autoCompactWindow } = await request.json();
-    
+    const { env, webMcpEnabled, exaMcpEnabled, autoCompactWindow } = await request.json();
+
     if (!env || typeof env !== "object") {
-      return NextResponse.json(
-        { error: "Invalid env object" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Invalid env object" }, { status: 400 });
     }
 
     const settingsPath = getClaudeSettingsPath();
     const claudeDir = path.dirname(settingsPath);
-
-    // Ensure .claude directory exists
     await fs.mkdir(claudeDir, { recursive: true });
 
-    // Read current settings
     let currentSettings = {};
     try {
       const content = await fs.readFile(settingsPath, "utf-8");
-      currentSettings = JSON.parse(content);
+      currentSettings = parseJsonc(content);
     } catch (error) {
-      if (error.code !== "ENOENT") {
-        throw error;
-      }
+      if (error.code !== "ENOENT") throw error;
     }
 
-    // Normalize ANTHROPIC_BASE_URL to ensure /v1 suffix
     if (env.ANTHROPIC_BASE_URL) {
-      env.ANTHROPIC_BASE_URL = env.ANTHROPIC_BASE_URL.endsWith("/v1") 
-        ? env.ANTHROPIC_BASE_URL 
+      env.ANTHROPIC_BASE_URL = env.ANTHROPIC_BASE_URL.endsWith("/v1")
+        ? env.ANTHROPIC_BASE_URL
         : `${env.ANTHROPIC_BASE_URL}/v1`;
     }
 
-    // Merge new env with existing settings
     const newSettings = {
       ...currentSettings,
       hasCompletedOnboarding: true,
@@ -166,37 +244,46 @@ export async function POST(request) {
       },
     };
 
-    // CLAUDE_CODE_AUTO_COMPACT_WINDOW — the token threshold that triggers
-    // auto-compact. Only set when a concrete value is chosen; "Default" removes
-    // the key so Claude Code derives the window from the model.
     if (autoCompactWindow) {
       newSettings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(autoCompactWindow);
     } else {
       delete newSettings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
     }
 
-    // Write new settings
-    await fs.writeFile(settingsPath, JSON.stringify(newSettings, null, 2));
+    await fs.writeFile(settingsPath, JSON.stringify(newSettings, null, 2), { mode: 0o600 });
+    await fs.chmod(settingsPath, 0o600);
 
-    // Exa MCP toggle — write to ~/.claude.json (CLI reads mcpServers from here).
-    if (EXA_PLUGIN) {
-      await writeClaudeJsonMcp(exaMcpEnabled ? { exa: buildExaMcpEntry() } : null);
+    const merge = {};
+    const remove = [];
+
+    if (webMcpEnabled) {
+      const token = await ensureWebMcpToken(getSettings, updateSettings);
+      merge[WEB_MCP_NAME] = buildWebMcpEntry(token);
+    } else {
+      remove.push(WEB_MCP_NAME);
     }
 
-    return NextResponse.json({
-      success: true,
-      message: "Settings updated successfully",
-    });
+    // Legacy Exa toggle — only touch when explicitly present in the payload.
+    if (exaMcpEnabled === true && EXA_PLUGIN) {
+      merge.exa = buildExaMcpEntry();
+    } else if (exaMcpEnabled === false) {
+      remove.push("exa");
+    }
+
+    if (Object.keys(merge).length > 0 || remove.length > 0) {
+      await writeClaudeJsonMcp(Object.keys(merge).length ? merge : null, remove);
+    }
+
+    return NextResponse.json({ success: true, message: "Settings updated successfully" });
   } catch (error) {
     console.log("Error updating claude settings:", error);
     return NextResponse.json(
-      { error: "Failed to update claude settings" },
-      { status: 500 }
+      { error: error.message || "Failed to update claude settings" },
+      { status: error.status || 500 }
     );
   }
 }
 
-// Fields to remove when resetting
 const RESET_ENV_KEYS = [
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_AUTH_TOKEN",
@@ -207,53 +294,36 @@ const RESET_ENV_KEYS = [
   "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
 ];
 
-// DELETE - Reset settings (remove env fields)
 export async function DELETE() {
   try {
     const settingsPath = getClaudeSettingsPath();
 
-    // Read current settings
     let currentSettings = {};
     try {
       const content = await fs.readFile(settingsPath, "utf-8");
-      currentSettings = JSON.parse(content);
+      currentSettings = parseJsonc(content);
     } catch (error) {
       if (error.code === "ENOENT") {
-        return NextResponse.json({
-          success: true,
-          message: "No settings file to reset",
-        });
+        await writeClaudeJsonMcp(null, [WEB_MCP_NAME, "exa"]);
+        return NextResponse.json({ success: true, message: "No settings file to reset" });
       }
       throw error;
     }
 
-    // Remove specified env fields
     if (currentSettings.env) {
       RESET_ENV_KEYS.forEach((key) => {
         delete currentSettings.env[key];
       });
-      
-      // Clean up empty env object
-      if (Object.keys(currentSettings.env).length === 0) {
-        delete currentSettings.env;
-      }
+      if (Object.keys(currentSettings.env).length === 0) delete currentSettings.env;
     }
 
-    // Remove injected MCP servers (Exa) from ~/.claude.json
-    await writeClaudeJsonMcp(null);
-
-    // Write updated settings
+    await writeClaudeJsonMcp(null, [WEB_MCP_NAME, "exa"]);
     await fs.writeFile(settingsPath, JSON.stringify(currentSettings, null, 2));
+    await fs.chmod(settingsPath, 0o600);
 
-    return NextResponse.json({
-      success: true,
-      message: "Settings reset successfully",
-    });
+    return NextResponse.json({ success: true, message: "Settings reset successfully" });
   } catch (error) {
     console.log("Error resetting claude settings:", error);
-    return NextResponse.json(
-      { error: "Failed to reset claude settings" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Failed to reset claude settings" }, { status: 500 });
   }
 }
