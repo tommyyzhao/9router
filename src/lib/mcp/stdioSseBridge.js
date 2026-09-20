@@ -1,5 +1,5 @@
-// Inline stdio<->SSE bridge for MCP. Spawns one child per plugin on demand,
-// broadcasts JSON-RPC frames over SSE, accepts client messages via HTTP POST.
+// Inline stdio<->SSE bridge for MCP + in-process internal plugins.
+// Spawns one child per stdio plugin on demand. Internal plugins never spawn.
 
 const { spawn } = require("child_process");
 const crypto = require("crypto");
@@ -11,7 +11,8 @@ const COLLAPSE_THRESHOLD = 30;
 const COLLAPSE_KEEP_HEAD = 10;
 const COLLAPSE_KEEP_TAIL = 5;
 
-// Drop noise nodes, collapse repeated siblings, hard-truncate. Preserve [ref=eXX].
+const INTERNAL_NAMES = new Set(["9router-web"]);
+
 function smartFilterText(text) {
   if (typeof text !== "string" || text.length < 2000) return text;
   let out = text;
@@ -25,7 +26,6 @@ function smartFilterText(text) {
   return out;
 }
 
-// Group consecutive lines sharing the same leading indent + role prefix; collapse if >= COLLAPSE_THRESHOLD.
 function collapseRepeated(text) {
   const lines = text.split("\n");
   const out = [];
@@ -80,7 +80,6 @@ function findLastNSiblingStart(lines, end, indent, role, n) {
   return positions.length > n ? positions[positions.length - n] : end;
 }
 
-// Apply filter to JSON-RPC tool/result content text blocks only.
 function filterFrame(line) {
   try {
     const msg = JSON.parse(line);
@@ -96,29 +95,44 @@ function filterFrame(line) {
     return mutated ? JSON.stringify(msg) : line;
   } catch { return line; }
 }
+
 const getStore = () => {
   if (!globalThis[G_KEY]) globalThis[G_KEY] = new Map();
   return globalThis[G_KEY];
 };
 
-// Only preset stdio plugins may spawn. No user-defined commands (RCE prevention).
+function isInternal(name) {
+  return INTERNAL_NAMES.has(name);
+}
+
+// Stdio presets only; internal plugins are virtual (no command).
 function findPlugin(name) {
+  if (isInternal(name)) {
+    return { name, kind: "internal", toolNames: name === "9router-web" ? ["web_search", "web_fetch"] : [] };
+  }
   return LOCAL_STDIO_PLUGINS.find((p) => p.name === name) || null;
 }
 
 function getOrSpawn(name) {
   const store = getStore();
   let entry = store.get(name);
+
+  if (isInternal(name)) {
+    if (entry && entry.kind === "internal") return entry;
+    entry = { kind: "internal", proc: null, sessions: new Map() };
+    store.set(name, entry);
+    return entry;
+  }
+
   if (entry?.proc && !entry.proc.killed && entry.proc.exitCode === null) return entry;
 
   const plugin = findPlugin(name);
-  if (!plugin) throw new Error(`Unknown local plugin: ${name}`);
+  if (!plugin || plugin.kind === "internal") throw new Error(`Unknown local plugin: ${name}`);
 
   const proc = spawn(plugin.command, plugin.args, { stdio: ["pipe", "pipe", "pipe"], env: process.env });
-  entry = { proc, sessions: new Map(), buffer: "" };
+  entry = { kind: "stdio", proc, sessions: new Map(), buffer: "" };
   store.set(name, entry);
 
-  // Parse newline-delimited JSON-RPC from child stdout, broadcast to all sessions.
   proc.stdout.on("data", (chunk) => {
     entry.buffer += chunk.toString("utf8");
     let idx;
@@ -128,7 +142,7 @@ function getOrSpawn(name) {
       if (!raw) continue;
       const line = filterFrame(raw);
       for (const send of entry.sessions.values()) {
-        try { send(`event: message\ndata: ${line}\n\n`); } catch { /* ignore broken pipe */ }
+        try { send(`event: message\ndata: ${line}\n\n`); } catch { /* ignore */ }
       }
     }
   });
@@ -149,35 +163,70 @@ function registerSession(name, sendFn) {
   return sid;
 }
 
+function getSessionSend(name, sid) {
+  const entry = getStore().get(name);
+  if (!entry) return null;
+  return entry.sessions.get(sid) || null;
+}
+
 function unregisterSession(name, sid) {
   const entry = getStore().get(name);
   if (!entry) return;
   entry.sessions.delete(sid);
-  // No sessions left → kill child to avoid idle orphan process leak.
   if (entry.sessions.size === 0) {
-    try { entry.proc.kill(); } catch { /* ignore */ }
+    if (entry.proc) {
+      try { entry.proc.kill(); } catch { /* ignore */ }
+    }
     getStore().delete(name);
   }
 }
 
-// Kill all spawned MCP children — called on app shutdown to prevent orphans.
 function killAllBridges() {
   const store = getStore();
   for (const [name, entry] of store) {
-    try { entry.proc.kill(); } catch { /* ignore */ }
+    if (entry.proc) {
+      try { entry.proc.kill(); } catch { /* ignore */ }
+    }
     store.delete(name);
   }
 }
 
+/** Stdio only: write JSON-RPC to child stdin. */
 function sendToChild(name, jsonRpc) {
+  if (isInternal(name)) {
+    throw new Error(`Plugin is internal (use handleInternalMessage): ${name}`);
+  }
   const entry = getStore().get(name);
   if (!entry?.proc?.stdin?.writable) throw new Error(`Bridge not running: ${name}`);
   entry.proc.stdin.write(`${JSON.stringify(jsonRpc)}\n`);
 }
 
-function isRunning(name) {
-  const entry = getStore().get(name);
-  return !!(entry?.proc && !entry.proc.killed && entry.proc.exitCode === null);
+/**
+ * Deliver a JSON-RPC frame to one session only.
+ */
+function sendToSession(name, sid, jsonRpc) {
+  const send = getSessionSend(name, sid);
+  if (!send) throw new Error(`Unknown MCP session: ${sid}`);
+  const line = typeof jsonRpc === "string" ? jsonRpc : JSON.stringify(jsonRpc);
+  send(`event: message\ndata: ${line}\n\n`);
 }
 
-module.exports = { getOrSpawn, registerSession, unregisterSession, sendToChild, isRunning, findPlugin, killAllBridges };
+function isRunning(name) {
+  const entry = getStore().get(name);
+  if (!entry) return false;
+  if (entry.kind === "internal") return true;
+  return !!(entry.proc && !entry.proc.killed && entry.proc.exitCode === null);
+}
+
+module.exports = {
+  getOrSpawn,
+  registerSession,
+  unregisterSession,
+  sendToChild,
+  sendToSession,
+  getSessionSend,
+  isRunning,
+  findPlugin,
+  killAllBridges,
+  isInternal,
+};

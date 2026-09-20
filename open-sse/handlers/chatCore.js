@@ -172,6 +172,16 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     } catch (e) { log?.warn?.("MODALITY", `image prefetch failed: ${e.message}`); }
   }
 
+  // Pre-translate dedupe: strip Claude built-ins when equivalent MCP tools are present
+  // on the CLIENT tool list (covers nested provider formats after translation miss).
+  if (clientTool === "claude" && Array.isArray(body?.tools)) {
+    const { tools: clientDeduped, stripped: clientStripped } = dedupeTools(body.tools);
+    if (clientStripped.length > 0) {
+      body = { ...body, tools: clientDeduped };
+      log?.debug?.("TOOLDEDUP", `pre-translate stripped ${clientStripped.length}: ${clientStripped.slice(0, 3).join(", ")}`);
+    }
+  }
+
   let translatedBody;
   let toolNameMap;
   let customToolNames;

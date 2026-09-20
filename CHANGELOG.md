@@ -1,6 +1,7 @@
 # Unreleased
 
 ## Features
+- **Claude Code / MCP**: add local in-process `9router-web` MCP (`web_search` → `search-combo`, `web_fetch` → `fetch-combo`). Injected via CLI Tools as **9Router Web MCP** using loopback SSE + scoped `x-9r-mcp-token` (not the admin CLI token). Tool dedupe strips built-in `WebSearch`/`WebFetch` when MCP tools are present (pre- and post-translate).
 - **Mistral**: add Mistral Vibe CLI catalog (`mistral-vibe-cli-latest` / `-fast` / `-with-tools`, `devstral-small-latest`) plus Medium 3.5 / Small / Magistral rows, thinking levels, and capabilities for Vibe/Devstral/Medium
 - **Mistral**: show Mistral/Vibe connections on the Quota Tracker as credential health + local spend (7d/30d requests/tokens/cost through 9Router). Public `api.mistral.ai` has no usage HTTP for personal keys.
 - **Muse Code**: add the Muse Code subscription as an OAuth provider (`meta` / `muse`). Import the local `muse login` key or sign in with device code. Routes Muse Spark through `https://api.meta.ai/v1/responses`. PAYG Model API dashboard keys are not supported.
@@ -9,6 +10,8 @@
 - **Xiaomi MiMo**: add Desktop harness subscription tiles `mimo-auto` / `mimo-flash` / `mimo-pro` (cookie route), TTS voice clone/design, and `X-Mimo-Source: mimocode-cli` on cloud transports
 
 ## Fixes
+- **MCP auth**: `/api/mcp/*` now requires loopback **and** a path-appropriate credential before other guard lists. `9router-web` accepts only the MCP token; other MCP bridges (e.g. Cowork `browsermcp`) still accept CLI token or dashboard JWT, but no longer from non-loopback peers. Production must run via `custom-server.js` (without it MCP auth fails closed).
+- **Settings**: `webMcpToken` is redacted from `GET /api/settings`, stripped from cloud export, and not mass-assignable.
 - **Xiaomi MiMo**: align Desktop account-session glue with MiMo Desktop 26.x — multi-path cookie discovery (`Xiaomi MiMo AI/Partitions/xiaomi-account/Cookies`), region-aware `mimo-server-{sgp,ru,in,cn}` hosts from `apm-region.json` / connection override, passToken-only auto-import when `auth.json` is absent
 - **Muse Code**: register `meta` in the provider connection tester (`OAUTH_TEST_CONFIG`) so Muse Code no longer returns "Provider test not supported"; probe `api.meta.ai/v1/models` with the CLI User-Agent and reject non-`LLM|` tokens with a re-import hint.
 - **ClinePass**: register `clinepass` in `OAUTH_TEST_CONFIG` and share the Cline `/api/v1/users/me` probe so Test Connection stops returning "Provider test not supported".

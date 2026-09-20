@@ -19,6 +19,15 @@ const DEDUP_RULES = [
     triggers: [/^mcp__browsermcp__/],
     strip: [/^mcp__Claude_in_Chrome__/],
   },
+  {
+    // 9Router local web MCP — paired: one tool must not strip the other capability.
+    triggers: ["mcp__9router-web__web_search"],
+    strip: ["WebSearch"],
+  },
+  {
+    triggers: ["mcp__9router-web__web_fetch"],
+    strip: ["WebFetch", "mcp__workspace__web_fetch"],
+  },
 ];
 
 function getToolName(t) {
