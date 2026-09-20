@@ -28,7 +28,7 @@ const getClaudeSettingsPath = () => {
 
 const getClaudeJsonPath = () => path.join(os.homedir(), ".claude.json");
 
-/** String-aware JSONC: strip // and /* */ comments only outside string literals. */
+// String-aware JSONC: strip line and block comments only outside string literals.
 function stripJsoncComments(text) {
   let out = "";
   let inStr = false;
