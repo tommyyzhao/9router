@@ -3,7 +3,7 @@
 **Date:** 2026-09-21 (PT)
 **Canonical MiMo precedent:** docs/plans/2026-09-16-xiaomi-mimo-harness-alignment.md
 **Harness:** `/Applications/Grok Bot.app` (Anysphere Sand white-label)
-**Branch:** `feat/grok-bot-desktop-discover` (PR-A)
+**Branch:** `feat/grok-bot-desktop-discover` (PR-A discover → PR-B decrypt+probe)
 
 LT confirmed: Grok Bot.app Desktop, **not** Grok Build CLI (`grok-cli`).
 
@@ -16,9 +16,10 @@ Grok Bot.app is Anysphere Sand (`com.anysphere.sand`), Cursor-family auth to
 |---|---|
 | App data | `~/Library/Application Support/Grok Bot/` |
 | Secrets file | `sand-secrets.json` (Electron safeStorage **v10**, `djEw…` blobs) |
-| Keychain service | `Grok Bot Safe Storage` |
+| Keychain service | `Grok Bot Safe Storage` (account `Grok Bot Key`) |
 | Status file | `desktop-status.json` (`signedIn`, `appVersion`, …) |
 | Cookies | empty for auth — **not** a MiMo-style cookie scrape |
+| Client headers (asar) | `x-cursor-client-type: sand`, `x-cursor-client-source: sand-desktop` |
 
 `sand-secrets.json` top-level keys (schema only; values stay sealed):
 
@@ -30,7 +31,7 @@ Grok Bot.app is Anysphere Sand (`com.anysphere.sand`), Cursor-family auth to
 
 ## 1. Goal
 
-Discover (PR-A) and later use (PR-B) a signed-in Grok Bot Desktop session.
+Discover (PR-A) and use (PR-B+) a signed-in Grok Bot Desktop session.
 MiMo shape: dedicated desktop import, one provider card.
 
 ## 2. Non-goals
@@ -40,50 +41,69 @@ MiMo shape: dedicated desktop import, one provider card.
 - Restart `:20128`.
 - Confuse with `grok-cli` / `xai` / `grok-web`.
 - Silently fold into Cursor IDE `state.vscdb` import without a distinct source.
+- Fake a working chat path when probe shows blockers.
 
 ## 3. Architecture
 
 | Piece | Choice |
 |---|---|
 | Registry id | `grok-bot` (aliases `sand`, `gbot`) |
-| Auto-import | Dedicated `GET /api/oauth/grok-bot/auto-import` |
-| Reuse Cursor Connect | Only after decrypt + probe (**PR-B**) |
-| PSD (PR-B) | `clientType: sand`, `authMethod: grok-bot-desktop-import` |
+| Auto-import GET | Discover only — no plaintext |
+| Auto-import POST | Decrypt (Keychain + OSCrypt v10) → `createProviderConnection` |
+| PSD | `clientType: sand`, `clientSource: sand-desktop`, `authMethod: grok-bot-desktop-import` |
+| Executor | Wired stub: reuses Cursor checksum/header helpers with sand options; **refuses chat** until stream probe clears |
 
 ## 4. Implementation slices
 
-### PR-A — Discover only (this change)
+### PR-A — Discover only (landed)
 
-**Files**
+Path candidates + schema parse, GET discover, hidden stub, unit fixtures.
 
-1. This plan file
-2. `open-sse/shared/grokBotAccount.js` — path candidates + `sand-secrets` schema
-   parse **only** (no decrypt, no Keychain)
-3. `GET /api/oauth/grok-bot/auto-import` — returns
-   `{ found, path, signedIn, accountScopePresent, sealed: true,
-     encryption: "electron-safeStorage-v10",
-     keychainService: "Grok Bot Safe Storage" }` —
-   **no** ciphertext / plaintext tokens
-4. Registry stub `grok-bot` (`hidden: true`) — display + notice, **no**
-   executor wiring
-5. `tests/unit/grok-bot-account-paths.test.js` with fixtures (fake `djEw` blobs)
+### PR-B — Decrypt + probe + store (this change)
 
-**Done when**
+1. **Live wire probe** (ephemeral; temps deleted) against `api2.cursor.sh` with
+   Sand-decrypted session JWT + cursor checksum helpers.
+2. Server-side decrypt helpers in `open-sse/shared/grokBotAccount.js`.
+3. POST `/api/oauth/grok-bot/auto-import` stores connection after decrypt.
+4. Registry un-hidden; executor registered but chat path honestly blocked.
+5. Unit tests: OSCrypt fixture vectors + mocked Keychain runner (no live Keychain).
 
-- Unit tests green without decrypting or touching Keychain.
-- Live host with a signed-in Desktop reports `found: true`,
-  `accountScopePresent: true`, `signedIn: true` (when status says so).
-- No secret values in logs, API responses, or test snapshots.
+#### Probe matrix (2026-09-21 PT) — no secrets
 
-### PR-B — Decrypt + probe + store (later)
+Content-type note: unary Connect/protobuf needs **`application/proto`**
+(raw empty body). `application/connect+proto` → **415**; `application/x-protobuf` → **415**.
 
-Decrypt sealed fields via Electron safeStorage / Keychain, sand-header probe
-against `api2.cursor.sh`, then store a connection with distinct
-`authMethod: grok-bot-desktop-import` (reuse Cursor Connect/checksum only
-after that probe).
+| RPC | client-type | checksum | content-type | HTTP | Notes |
+|---|---|---|---|---|---|
+| `DashboardService/GetMe` | sand (+ source) | present | application/proto | **200** | body parses (profile fields) |
+| `DashboardService/GetMe` | ide (same Sand token) | present | application/proto | **200** | Sand token works as ide |
+| `DashboardService/GetMe` | sand | **absent** | application/proto | **200** | checksum not required for GetMe |
+| `DashboardService/GetUserPrivacyMode` | sand / ide | present | application/proto | **200** | |
+| `AiService/AvailableModels` | sand / ide | present | application/proto | **200** | |
+| `DashboardService/GetSandAccessStatus` | sand / ide | present | application/proto | **200** | |
+| `AgentService/GetUsableModels` | sand | present | connect+proto | **415** | wrong CT in first sweep |
+| `AgentService/Run` | **sand** | present | connect+proto | 200 trailer | **`invalid_argument`: Sand traffic is not supported on this endpoint** |
+| `AgentService/Run` | ide | present | connect+proto | 200 | empty/minimal → binary frame (not a proven chat) |
+| `ChatService/StreamUnifiedChatWithTools` | sand / ide | present | connect+proto | 200 trailer | empty → `invalid_argument`; minimal body → **`resource_exhausted` / Update Required** (version gate) |
+| `InferenceService/Stream` | sand / ide | present | connect+proto | 200 trailer | **`unauthenticated`** |
+
+**Conclusions**
+
+- Decrypt (Keychain `Grok Bot Safe Storage` / account `Grok Bot Key` + OSCrypt v10) works.
+- Sand session JWT authenticates unary Dashboard/AiService for **both** `sand` and `ide` client-types.
+- Checksum is **not** strictly required for GetMe.
+- **Chat path blocked for reuse as-is:** AgentService rejects `clientType=sand`; ChatService version-gated; InferenceService unauthenticated for this Sand JWT.
+- Do **not** fake chat; PR-C needs a supported stream path (likely Sand-native Inference with correct authMode / client version).
+
+### PR-C — Working chat (future)
+
+Clear `CHAT_PATH_PROBE.status` only after a successful minimal stream with a
+supported Sand client version / Inference authMode. Then delegate to Cursor-style
+Connect streaming with sand headers.
 
 ## 5. Fail-open rules
 
 - Missing profile / unreadable file → `found: false` with a clear error.
-- Parse failure → `found: false`; never throw ciphertext into the response.
-- Never log or return sealed blob contents.
+- Parse / decrypt failure → error response; never throw ciphertext into the response.
+- Never log or return sealed blob contents, Keychain passwords, or JWTs.
+- GET discover never returns plaintext; only POST import decrypts server-side into the store.
