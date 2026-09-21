@@ -195,7 +195,7 @@ describe("compressWithHeadroom", () => {
 
   it("skips unknown shapes", async () => {
     global.fetch = vi.fn();
-    const body = { contents: [{ parts: [{ text: "long" }] }] };
+    const body = { weirdShape: [{ parts: [{ text: "long" }] }] };
 
     const stats = await compressWithHeadroom(body, { enabled: true, url: "http://localhost:8787" });
 
