@@ -80,6 +80,13 @@ export class XiaomiMimoExecutor extends DefaultExecutor {
     // arrays (see the xiaomi-mimo rule in translator/concerns/paramSupport.js).
     const out = super.transformRequest(model, body, stream, credentials);
 
+    // The account-service route 415s (biz_code 10008 media_type_not_supported)
+    // when `stream` is absent from the JSON body — the transport-level Accept
+    // header alone is not enough. Default it, never override an explicit value.
+    if (XiaomiMimoExecutor.isAccountRouteModel(model) && out.stream == null && stream != null) {
+      out.stream = stream;
+    }
+
     // Preview models: thinking/params get defaults only — never override what the
     // caller set explicitly. (body.model is already `xiaomi/<id>` via upstreamModelId.)
     // Subscription aliases (mimo-flash/pro) stay untouched — Desktop sends them as-is.

@@ -120,4 +120,21 @@ describe("xiaomi-mimo executor", () => {
     expect(bareModel("xiaomi/mimo-x-pro-preview")).toBe("mimo-x-pro-preview");
     expect(bareModel("mimo-x-pro-preview")).toBe("mimo-x-pro-preview");
   });
+
+  it("defaults stream on account-route bodies (route 415s without it)", () => {
+    // Regression: the account-service route returns 415 media_type_not_supported
+    // (biz_code 10008) when `stream` is absent from the JSON body.
+    expect(ex.transformRequest("mimo-x-flash-preview", { messages: [] }, true, {}).stream).toBe(true);
+    expect(ex.transformRequest("mimo-x-pro-preview", { messages: [] }, false, {}).stream).toBe(false);
+    expect(ex.transformRequest("mimo-auto", { messages: [] }, true, {}).stream).toBe(true);
+  });
+
+  it("never overrides an explicit stream value on account-route bodies", () => {
+    expect(ex.transformRequest("mimo-x-flash-preview", { messages: [], stream: false }, true, {}).stream).toBe(false);
+    expect(ex.transformRequest("mimo-x-flash-preview", { messages: [], stream: true }, false, {}).stream).toBe(true);
+  });
+
+  it("leaves cloud bodies without a stamped stream flag", () => {
+    expect(ex.transformRequest("mimo-v2.5-pro", { messages: [] }, true, {}).stream).toBeUndefined();
+  });
 });
