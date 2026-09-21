@@ -4,6 +4,7 @@ import {
   openaiResponsesToOpenAIRequest,
   openaiToOpenAIResponsesRequest,
 } from "../translator/request/openai-responses.js";
+import { FORMATS } from "../translator/formats.js";
 
 const DEFAULT_TIMEOUT_MS = 3000;
 
@@ -26,6 +27,8 @@ function messagePayload(body) {
   if (Array.isArray(body?.input)) return body.input;
   const kiro = collectKiroHeadroomMessages(body);
   if (kiro) return kiro.messages;
+  const gemini = collectGeminiHeadroomMessages(body);
+  if (gemini) return gemini.messages;
   return null;
 }
 
@@ -167,6 +170,85 @@ function collectKiroHeadroomMessages(body) {
   return messages.length > 0 ? { messages, targets } : null;
 }
 
+// Gemini shape: contents[]/systemInstruction are projected to OpenAI-ish
+// pseudo-messages by *position*, never round-tripped through the Gemini<->OpenAI
+// translator (that pivot is lossy: systemInstruction collapse, generationConfig
+// rebuild, thoughtSignature loss). Only plain text parts (and functionResponse
+// payloads) are sent to the proxy; thoughtSignature, `thought:true` parts,
+// inlineData, fileData, generationConfig, safetySettings and tools never leave
+// this process and are written back byte-identical.
+function collectGeminiHeadroomMessages(body) {
+  if (!Array.isArray(body?.contents)) return null;
+
+  const messages = [];
+  const targets = [];
+
+  const addTextTarget = (role, text, target, extra = {}) => {
+    if (typeof text !== "string") return;
+    messages.push({ role, content: text, ...extra });
+    targets.push(target);
+  };
+
+  const sysParts = body.systemInstruction?.parts;
+  if (Array.isArray(sysParts)) {
+    for (const part of sysParts) {
+      if (part?.thought === true) continue;
+      addTextTarget("system", part?.text, { object: part, key: "text" });
+    }
+  }
+
+  for (const content of body.contents) {
+    const role = content?.role === "model" ? "assistant" : "user";
+    const parts = content?.parts;
+    if (!Array.isArray(parts)) continue;
+
+    for (const part of parts) {
+      if (!part || typeof part !== "object") continue;
+      if (part.thought === true) continue; // never expose hidden reasoning to the proxy
+      if (part.inlineData || part.fileData) continue; // binary payloads stay untouched
+
+      if (typeof part.text === "string") {
+        addTextTarget(role, part.text, { object: part, key: "text" });
+        continue;
+      }
+
+      if (part.functionCall) {
+        // Pseudo tool-call message: keeps call/result pairing valid for the
+        // proxy's turn structure. Nothing here is written back — the target
+        // has no key, so applyProjectedHeadroomMessages skips it — the
+        // functionCall part (id/name/args) stays byte-identical.
+        const fc = part.functionCall;
+        messages.push({
+          role: "assistant",
+          content: "",
+          tool_calls: [{
+            id: fc.id || fc.name || "",
+            type: "function",
+            function: { name: fc.name || "", arguments: JSON.stringify(fc.args || {}) },
+          }],
+        });
+        targets.push({ object: null, key: null });
+        continue;
+      }
+
+      if (part.functionResponse) {
+        const fr = part.functionResponse;
+        addTextTarget(
+          "tool",
+          JSON.stringify(fr.response),
+          { object: fr, key: "response", isJson: true },
+          { tool_call_id: fr.id || fr.name || "" }
+        );
+        continue;
+      }
+
+      // thoughtSignature-only or otherwise unrecognized parts: leave alone.
+    }
+  }
+
+  return messages.length > 0 ? { messages, targets } : null;
+}
+
 function textFromHeadroomMessage(message) {
   const content = message?.content;
   if (typeof content === "string") return content;
@@ -183,9 +265,9 @@ function textFromHeadroomMessage(message) {
   return parts.length > 0 ? parts.join("\n") : null;
 }
 
-function applyKiroHeadroomMessages(projection, compressedMessages, diagnostics) {
+function applyProjectedHeadroomMessages(projection, compressedMessages, diagnostics, label = "Kiro") {
   if (!Array.isArray(compressedMessages) || compressedMessages.length !== projection.messages.length) {
-    setDiagnostic(diagnostics, "proxy response did not match Kiro message count");
+    setDiagnostic(diagnostics, `proxy response did not match ${label} message count`);
     return false;
   }
 
@@ -193,21 +275,36 @@ function applyKiroHeadroomMessages(projection, compressedMessages, diagnostics) 
   for (let i = 0; i < projection.messages.length; i++) {
     const expected = projection.messages[i];
     const actual = compressedMessages[i];
+    const target = projection.targets[i];
     if (!actual || actual.role !== expected.role) {
-      setDiagnostic(diagnostics, "proxy response did not preserve Kiro message order");
+      setDiagnostic(diagnostics, `proxy response did not preserve ${label} message order`);
       return false;
     }
+    if (!target.key) continue; // pseudo message with nothing to write back (e.g. Gemini functionCall)
 
     const text = textFromHeadroomMessage(actual);
     if (text === null) {
-      setDiagnostic(diagnostics, "proxy response missing Kiro text content");
+      setDiagnostic(diagnostics, `proxy response missing ${label} text content`);
       return false;
     }
-    updates.push({ target: projection.targets[i], text });
+    updates.push({ target, text });
   }
 
   for (const update of updates) {
-    update.target.object[update.target.key] = update.text;
+    if (update.target.isJson) {
+      // functionResponse payloads must stay valid JSON. If the proxy's
+      // compressed text isn't parseable JSON (e.g. SmartCrusher shortened a
+      // plain string), wrap it so functionResponse.response stays an object.
+      let parsed;
+      try {
+        parsed = JSON.parse(update.text);
+      } catch {
+        parsed = { output: update.text };
+      }
+      update.target.object[update.target.key] = parsed;
+    } else {
+      update.target.object[update.target.key] = update.text;
+    }
   }
   return true;
 }
@@ -317,7 +414,23 @@ export async function compressWithHeadroom(body, { enabled, url, model, format, 
       }
       const data = await callCompress(url, projection.messages, model, timeoutMs, compressUserMessages, diagnostics || {});
       if (!data) return null;
-      if (!applyKiroHeadroomMessages(projection, data.messages, diagnostics)) return null;
+      if (!applyProjectedHeadroomMessages(projection, data.messages, diagnostics, "Kiro")) return null;
+      if (diagnostics) diagnostics.after = captureSizeSnapshot(body);
+      return data;
+    }
+
+    // Gemini shape: contents[]/systemInstruction are projected by position (see
+    // collectGeminiHeadroomMessages) rather than translated — the Gemini<->OpenAI
+    // pivot is lossy for thoughtSignature/generationConfig/systemInstruction.
+    if (format === FORMATS.GEMINI || format === FORMATS.GEMINI_CLI || Array.isArray(body?.contents)) {
+      const projection = collectGeminiHeadroomMessages(body);
+      if (!projection) {
+        setDiagnostic(diagnostics, "unsupported gemini request shape");
+        return null;
+      }
+      const data = await callCompress(url, projection.messages, model, timeoutMs, compressUserMessages, diagnostics || {});
+      if (!data) return null;
+      if (!applyProjectedHeadroomMessages(projection, data.messages, diagnostics, "Gemini")) return null;
       if (diagnostics) diagnostics.after = captureSizeSnapshot(body);
       return data;
     }
