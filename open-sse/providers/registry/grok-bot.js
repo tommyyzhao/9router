@@ -1,5 +1,5 @@
 /**
- * Grok Bot Desktop (Anysphere Sand) — discover stub (PR-A).
+ * Grok Bot Desktop (Anysphere Sand) — PR-B spike.
  *
  * Dedicated provider card for the Grok Bot.app Desktop session. Distinct from:
  *   - grok-cli  → Grok Build / cli-chat-proxy.grok.com
@@ -7,13 +7,15 @@
  *   - xai       → api.x.ai PAYG
  *   - cursor    → Cursor IDE state.vscdb import
  *
- * PR-A: hidden stub + discover API only. No executor wiring.
- * PR-B: decrypt sand-secrets, sand-header probe, store connection
- *       (clientType sand, authMethod grok-bot-desktop-import).
+ * PR-A: discover API (GET auto-import) — schema only.
+ * PR-B: Keychain + OSCrypt v10 decrypt → POST auto-import stores connection.
+ *       Executor is wired but chat path is honestly blocked pending stream probe
+ *       (AgentService.Run rejects sand; ChatService version-gated; Inference unauth).
  */
 export default {
   id: "grok-bot",
-  hidden: true,
+  // Visible card so Desktop import is reachable; chat path still probe-blocked.
+  hidden: false,
   priority: 55,
   alias: "gbot",
   aliases: ["sand", "gbot", "grok-bot-desktop"],
@@ -25,19 +27,36 @@ export default {
     textIcon: "GB",
     website: "https://grok.com",
     notice: {
-      text: "Coming soon: import a signed-in Grok Bot.app Desktop session (Anysphere Sand). Distinct from Grok Build CLI and Grok Web cookie. Discover endpoint: GET /api/oauth/grok-bot/auto-import.",
+      text: "Import a signed-in Grok Bot.app Desktop session (Anysphere Sand). Decrypt+store works; chat/stream path still probe-blocked (see plan PR-B). Distinct from Grok Build CLI and Grok Web cookie.",
       signupUrl: "https://grok.com",
     },
   },
   category: "oauth",
   authModes: ["oauth"],
   hasOAuth: true,
-  // No transport / models / executor in PR-A — discover-only stub.
-  models: [],
+  // Mirror Cursor transport for future stream reuse (executor currently refuses chat).
+  transport: {
+    baseUrl: "https://api2.cursor.sh",
+    chatPath: "/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
+    format: "cursor",
+    headers: {
+      "connect-accept-encoding": "gzip",
+      "connect-protocol-version": "1",
+      "Content-Type": "application/connect+proto",
+      "User-Agent": "connect-es/1.6.1",
+    },
+    clientVersion: "sand-desktop",
+  },
+  models: [
+    { id: "default", name: "Auto (Server Picks)" },
+  ],
   oauth: {
-    // PSD hints for PR-B (not used until decrypt+probe lands).
     clientType: "sand",
+    clientSource: "sand-desktop",
     apiEndpoint: "https://api2.cursor.sh",
+    chatEndpoint: "/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
+    modelsEndpoint: "/aiserver.v1.AiService/AvailableModels",
     authMethod: "grok-bot-desktop-import",
+    chatPathStatus: "blocked",
   },
 };
