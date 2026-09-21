@@ -87,9 +87,113 @@ export function isTailscaleInstalled() {
   return getTailscaleBin() !== null;
 }
 
-/** Build tailscale CLI args with custom socket (no root needed) */
-function tsArgs(...args) {
-  return [...SOCKET_FLAG, ...args];
+/**
+ * Socket backends, in probe order:
+ * 1. 9Router custom socket (userspace/TUN daemon we spawn)
+ * 2. Default CLI (no --socket) — macOS Tailscale.app + Linux system service
+ * 3. Explicit system Unix socket (when present)
+ *
+ * macOS App installs do NOT create /var/run/tailscale/tailscaled.sock; the CLI
+ * talks to the GUI/system-extension via its own IPC when `--socket` is omitted.
+ * Always forcing the custom socket against a dead sock yields "no auth URL".
+ */
+const BACKEND_CANDIDATES = [
+  { name: "custom", socketArgs: SOCKET_FLAG, requireSocketFile: true },
+  { name: "default", socketArgs: [], requireSocketFile: false },
+  { name: "system", socketArgs: SYSTEM_SOCKET_FLAG, requireSocketFile: true },
+];
+
+const activeBackendCache = { value: null, fetchedAt: 0, resolving: false };
+
+function statusJsonFromStdout(stdout) {
+  const json = JSON.parse(stdout);
+  if (!json || typeof json !== "object") return null;
+  // Reject CLI connection-failure payloads; require a real backend state.
+  if (!json.BackendState) return null;
+  return json;
+}
+
+async function probeStatusWithSocketArgs(bin, socketArgs, timeoutMs = PROBE_TIMEOUT_MS) {
+  const flagPart = socketArgs.length ? `${socketArgs.join(" ")} ` : "";
+  const { stdout } = await execAsync(`"${bin}" ${flagPart}status --json`, {
+    windowsHide: true,
+    env: { ...process.env, PATH: EXTENDED_PATH },
+    timeout: timeoutMs,
+  });
+  return statusJsonFromStdout(stdout);
+}
+
+async function resolveActiveBackend(bin, { force = false } = {}) {
+  if (!bin) return null;
+  if (!force && activeBackendCache.value && Date.now() - activeBackendCache.fetchedAt < PROBE_TTL_MS) {
+    return activeBackendCache.value;
+  }
+  for (const candidate of BACKEND_CANDIDATES) {
+    if (candidate.requireSocketFile && candidate.socketArgs.length) {
+      const sockPath = candidate.socketArgs[candidate.socketArgs.length - 1];
+      if (sockPath && !fs.existsSync(sockPath)) continue;
+    }
+    try {
+      const json = await probeStatusWithSocketArgs(bin, candidate.socketArgs);
+      if (!json) continue;
+      const backend = { name: candidate.name, socketArgs: candidate.socketArgs, status: json };
+      activeBackendCache.value = backend;
+      activeBackendCache.fetchedAt = Date.now();
+      return backend;
+    } catch { /* try next */ }
+  }
+  // Nothing alive — remember custom as the spawn target, but mark cache stale.
+  activeBackendCache.value = {
+    name: "custom",
+    socketArgs: SOCKET_FLAG,
+    status: null,
+  };
+  activeBackendCache.fetchedAt = Date.now();
+  return activeBackendCache.value;
+}
+
+/** Socket CLI args for the live backend (custom / default / system). */
+export async function getActiveTailscaleSocketArgs({ force = false } = {}) {
+  const bin = getTailscaleBin();
+  const backend = await resolveActiveBackend(bin, { force });
+  return backend?.socketArgs || SOCKET_FLAG;
+}
+
+function cmdWithSocket(bin, socketArgs, ...rest) {
+  const flagPart = socketArgs?.length ? `${socketArgs.join(" ")} ` : "";
+  return `"${bin}" ${flagPart}${rest.join(" ")}`;
+}
+
+export function statusFromJson(json) {
+  const loggedIn = !!json && json.BackendState === "Running" && json.Self?.Online === true;
+  return { loggedIn, running: json?.BackendState === "Running", json };
+}
+
+/** Probe backends: custom, default CLI (Tailscale.app / system service), system socket. */
+export async function probeTailscaleStatus({ force = false } = {}) {
+  const bin = getTailscaleBin();
+  if (!bin) return { installed: false, backend: null, loggedIn: false, json: null };
+  const backend = await resolveActiveBackend(bin, { force });
+  const json = backend?.status || null;
+  const { loggedIn } = statusFromJson(json);
+  return {
+    installed: true,
+    backend: backend?.name || null,
+    socketArgs: backend?.socketArgs || SOCKET_FLAG,
+    loggedIn,
+    json,
+  };
+}
+
+export async function isDefaultCliBackendAlive() {
+  const bin = getTailscaleBin();
+  if (!bin) return false;
+  try {
+    const json = await probeStatusWithSocketArgs(bin, [], PROBE_TIMEOUT_MS);
+    return !!json && (json.BackendState === "Running" || json.BackendState === "Starting");
+  } catch {
+    return false;
+  }
 }
 
 // Async strict probe: authoritative, awaitable (never blocks event loop). Updates cache.
@@ -97,14 +201,9 @@ export async function isTailscaleLoggedInStrict() {
   const bin = getTailscaleBin();
   if (!bin) return false;
   try {
-    const { stdout } = await execAsync(`"${bin}" ${SOCKET_FLAG.join(" ")} status --json`, {
-      windowsHide: true,
-      env: { ...process.env, PATH: EXTENDED_PATH },
-      timeout: 5000
-    });
-    const json = JSON.parse(stdout);
-    // BackendState=Running + Self.Online=true → device still exists in tailnet
-    const loggedIn = json.BackendState === "Running" && json.Self?.Online === true;
+    const backend = await resolveActiveBackend(bin, { force: true });
+    const json = backend?.status;
+    const loggedIn = !!json && json.BackendState === "Running" && json.Self?.Online === true;
     loggedInCache.value = loggedIn;
     loggedInCache.fetchedAt = Date.now();
     return loggedIn;
@@ -122,9 +221,10 @@ function bgRefreshLoggedIn() {
     return;
   }
   loggedInCache.refreshing = true;
-  // Dual-socket aware: probe custom socket first, then system socket
-  probeStatusAsync(bin)
-    .then((json) => {
+  // Backend-aware: custom → default CLI (App/system) → system socket
+  resolveActiveBackend(bin, { force: true })
+    .then((backend) => {
+      const json = backend?.status;
       loggedInCache.value = !!json && json.BackendState === "Running" && json.Self?.Online === true;
     })
     .catch(() => { loggedInCache.value = false; })
@@ -134,23 +234,33 @@ function bgRefreshLoggedIn() {
     });
 }
 
-// Probe `status --json` over custom then system socket. Resolves parsed JSON or null. Never blocks event loop.
+// Probe `status --json` across backends. Resolves parsed JSON or null. Never blocks event loop.
 async function probeStatusAsync(bin) {
-  for (const socketArgs of [SOCKET_FLAG, SYSTEM_SOCKET_FLAG]) {
-    try {
-      const { stdout } = await execAsync(`"${bin}" ${socketArgs.join(" ")} status --json`, {
-        windowsHide: true, env: { ...process.env, PATH: EXTENDED_PATH }, timeout: PROBE_TIMEOUT_MS,
-      });
-      return JSON.parse(stdout);
-    } catch { /* try next socket */ }
-  }
-  return null;
+  const backend = await resolveActiveBackend(bin, { force: true });
+  return backend?.status || null;
 }
 
 // Sync getter: never blocks; returns last known state, refreshes in background
 export function isTailscaleLoggedIn() {
   if (Date.now() - loggedInCache.fetchedAt > PROBE_TTL_MS) bgRefreshLoggedIn();
   return loggedInCache.value;
+}
+
+async function probeFunnelStatusStrict() {
+  const bin = getTailscaleBin();
+  if (!bin) return false;
+  const socketArgs = await getActiveTailscaleSocketArgs({ force: true });
+  try {
+    const { stdout } = await execAsync(cmdWithSocket(bin, socketArgs, "funnel", "status", "--json"), {
+      windowsHide: true,
+      env: { ...process.env, PATH: EXTENDED_PATH },
+      timeout: PROBE_TIMEOUT_MS,
+    });
+    const json = JSON.parse(stdout);
+    return Object.keys(json.AllowFunnel || {}).length > 0;
+  } catch {
+    return false;
+  }
 }
 
 function bgRefreshRunning() {
@@ -162,13 +272,8 @@ function bgRefreshRunning() {
     return;
   }
   runningCache.refreshing = true;
-  execAsync(`"${bin}" ${SOCKET_FLAG.join(" ")} funnel status --json`, { windowsHide: true, timeout: PROBE_TIMEOUT_MS })
-    .then(({ stdout }) => {
-      try {
-        const json = JSON.parse(stdout);
-        runningCache.value = Object.keys(json.AllowFunnel || {}).length > 0;
-      } catch { runningCache.value = false; }
-    })
+  probeFunnelStatusStrict()
+    .then((running) => { runningCache.value = !!running; })
     .catch(() => { runningCache.value = false; })
     .finally(() => {
       runningCache.fetchedAt = Date.now();
@@ -185,36 +290,32 @@ export function isTailscaleRunning() {
 // Async strict probe for hot user-initiated paths (enable/connect flow).
 // Awaitable, never blocks event loop; updates cache as a side effect.
 export async function isTailscaleRunningStrict() {
-  const bin = getTailscaleBin();
-  if (!bin) return false;
-  try {
-    const { stdout } = await execAsync(`"${bin}" ${SOCKET_FLAG.join(" ")} funnel status --json`, {
-      windowsHide: true,
-      timeout: PROBE_TIMEOUT_MS,
-    });
-    const json = JSON.parse(stdout);
-    const running = Object.keys(json.AllowFunnel || {}).length > 0;
-    runningCache.value = running;
-    runningCache.fetchedAt = Date.now();
-    return running;
-  } catch {
-    return false;
-  }
+  const running = await probeFunnelStatusStrict();
+  runningCache.value = running;
+  runningCache.fetchedAt = Date.now();
+  return running;
 }
 
-// Check if a system-level tailscaled is running (uses system socket, not 9Router's custom one).
+// True when a non-custom backend is alive (system service or macOS Tailscale.app).
 export function isSystemDaemonRunning() {
-  if (IS_WINDOWS || !SYSTEM_TAILSCALE_SOCKET || !fs.existsSync(SYSTEM_TAILSCALE_SOCKET)) return false;
   const bin = getTailscaleBin();
   if (!bin) return false;
-  try {
-    const out = execSync(`"${bin}" ${SYSTEM_SOCKET_FLAG.join(" ")} status --json`, {
-      encoding: "utf8", windowsHide: true, env: { ...process.env, PATH: EXTENDED_PATH }, timeout: PROBE_TIMEOUT_MS,
-    });
-    return JSON.parse(out).BackendState === "Running";
-  } catch {
-    return false;
+  // Sync best-effort: default CLI first (macOS App / system package), then system socket.
+  const candidates = [];
+  if (!IS_WINDOWS) candidates.push([]);
+  if (!IS_WINDOWS && SYSTEM_TAILSCALE_SOCKET && fs.existsSync(SYSTEM_TAILSCALE_SOCKET)) {
+    candidates.push(SYSTEM_SOCKET_FLAG);
   }
+  for (const socketArgs of candidates) {
+    try {
+      const out = execSync(cmdWithSocket(bin, socketArgs, "status", "--json"), {
+        encoding: "utf8", windowsHide: true, env: { ...process.env, PATH: EXTENDED_PATH }, timeout: PROBE_TIMEOUT_MS,
+      });
+      const json = statusJsonFromStdout(out);
+      if (json?.BackendState === "Running") return true;
+    } catch { /* try next */ }
+  }
+  return false;
 }
 
 function bgRefreshFunnelUrl(port) {
@@ -222,11 +323,14 @@ function bgRefreshFunnelUrl(port) {
   const bin = getTailscaleBin();
   if (!bin) return;
   funnelUrlCache.refreshing = true;
-  execAsync(`"${bin}" ${SOCKET_FLAG.join(" ")} status --json`, { windowsHide: true, timeout: PROBE_TIMEOUT_MS })
+  getActiveTailscaleSocketArgs()
+    .then((socketArgs) => execAsync(cmdWithSocket(bin, socketArgs, "status", "--json"), {
+      windowsHide: true, timeout: PROBE_TIMEOUT_MS,
+    }))
     .then(({ stdout }) => {
       try {
-        const json = JSON.parse(stdout);
-        const dnsName = json.Self?.DNSName?.replace(/\.$/, "");
+        const json = statusJsonFromStdout(stdout);
+        const dnsName = json?.Self?.DNSName?.replace(/\.$/, "");
         funnelUrlCache.value = dnsName ? `https://${dnsName}` : null;
       } catch { /* keep prev */ }
     })
@@ -242,17 +346,24 @@ function bgRefreshFunnelUrl(port) {
 function getActualFunnelUrl() {
   const bin = getTailscaleBin();
   if (!bin) return null;
-  try {
-    const out = execSync(`"${bin}" ${SOCKET_FLAG.join(" ")} status --json`, {
-      encoding: "utf8",
-      windowsHide: true,
-      env: { ...process.env, PATH: EXTENDED_PATH },
-      timeout: 5000,
-    });
-    const json = JSON.parse(out);
-    const dnsName = json.Self?.DNSName?.replace(/\.$/, "");
-    return dnsName ? `https://${dnsName}` : null;
-  } catch { return null; }
+  const backend = activeBackendCache.value;
+  const socketArgsList = backend?.socketArgs !== undefined
+    ? [backend.socketArgs]
+    : [SOCKET_FLAG, [], SYSTEM_SOCKET_FLAG];
+  for (const socketArgs of socketArgsList) {
+    try {
+      const out = execSync(cmdWithSocket(bin, socketArgs, "status", "--json"), {
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, PATH: EXTENDED_PATH },
+        timeout: 5000,
+      });
+      const json = statusJsonFromStdout(out);
+      const dnsName = json?.Self?.DNSName?.replace(/\.$/, "");
+      if (dnsName) return `https://${dnsName}`;
+    } catch { /* try next */ }
+  }
+  return null;
 }
 
 /** Get funnel URL from tailscale status (cached, non-blocking) */
@@ -555,6 +666,20 @@ export async function startDaemonWithPassword(sudoPassword) {
     return;
   }
 
+  // macOS Tailscale.app / Linux system service already online → reuse it.
+  // Spawning a second custom tailscaled fights the App and produces a dead custom sock.
+  const bin0 = getTailscaleBin();
+  if (bin0) {
+    try {
+      const json = await probeStatusWithSocketArgs(bin0, [], 2000);
+      if (json?.BackendState === "Running") {
+        const backend = await resolveActiveBackend(bin0, { force: true });
+        console.log(`[Tailscale] reuse existing backend=${backend?.name || "default"}`);
+        return;
+      }
+    } catch { /* fall through to custom daemon */ }
+  }
+
   const currentMode = isDaemonTunMode(); // true=TUN, false=userspace, null=not running
   // No password but a healthy TUN daemon already runs → keep TUN, never downgrade-kill it.
   const wantTun = sudoPassword ? true : currentMode === true;
@@ -620,53 +745,74 @@ function ensureDaemon() {
   startDaemonWithPassword("").catch(() => {});
 }
 
-/** Read AuthURL from `tailscale status --json` (Win exposes it there, not stdout). */
+/** Read AuthURL from `tailscale status --json` across active backends. */
 function getAuthUrlFromStatus() {
   const bin = getTailscaleBin();
   if (!bin) return null;
-  try {
-    const out = execSync(`"${bin}" ${SOCKET_FLAG.join(" ")} status --json`, {
-      encoding: "utf8", windowsHide: true, timeout: 2000
-    });
-    const j = JSON.parse(out);
-    if (j.AuthURL) return j.AuthURL;
-    return null;
-  } catch { return null; }
+  const backend = activeBackendCache.value;
+  const socketArgsList = backend?.socketArgs !== undefined
+    ? [backend.socketArgs]
+    : [SOCKET_FLAG, [], SYSTEM_SOCKET_FLAG];
+  for (const socketArgs of socketArgsList) {
+    try {
+      const out = execSync(cmdWithSocket(bin, socketArgs, "status", "--json"), {
+        encoding: "utf8", windowsHide: true, timeout: 2000
+      });
+      const j = statusJsonFromStdout(out);
+      if (j?.AuthURL) return j.AuthURL;
+    } catch { /* try next */ }
+  }
+  return null;
 }
 
 /**
- * Run `tailscale up` and capture the auth URL for browser login.
+ * Run `tailscale login`/`up` against the *live* backend and capture the auth URL.
  * Resolves with { authUrl } or { alreadyLoggedIn: true }.
- * On Windows, AuthURL comes from `status --json` (not stdout) — must poll status.
+ *
+ * macOS Tailscale.app has no /var/run socket — CLI must omit --socket.
+ * Forcing a dead custom socket is what produced "timed out without auth URL".
  */
-export function startLogin(hostname) {
+export async function startLogin(hostname) {
   const bin = getTailscaleBin();
   if (!bin) return Promise.reject(new Error("Tailscale not installed"));
 
-  return new Promise((resolve, reject) => {
-    // Ensure daemon is running (best-effort, no sudo)
-    ensureDaemon();
+  const socketArgs = await getActiveTailscaleSocketArgs({ force: true });
 
-    // Check if already logged in
-    if (isTailscaleLoggedIn()) {
-      resolve({ alreadyLoggedIn: true });
-      return;
+  // Already online on the live backend → skip login entirely.
+  try {
+    const probe = await probeStatusWithSocketArgs(bin, socketArgs, 3000);
+    if (probe?.BackendState === "Running" && probe?.Self?.Online === true) {
+      return { alreadyLoggedIn: true };
     }
+  } catch { /* fall through to login */ }
 
-    const args = tsArgs("up", "--accept-routes");
-    if (hostname) args.push(`--hostname=${hostname}`);
-    const child = spawn(bin, args, {
+  return new Promise((resolve, reject) => {
+    // Prefer `login`; fall back to `up --reset` so non-default settings don't hard-fail.
+    const loginCmdArgs = [...socketArgs, "login"];
+    if (hostname) loginCmdArgs.push(`--hostname=${hostname}`);
+    const upCmdArgs = [...socketArgs, "up", "--reset", "--accept-routes"];
+    if (hostname) upCmdArgs.push(`--hostname=${hostname}`);
+
+    let child = spawn(bin, loginCmdArgs, {
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
       windowsHide: true
     });
+    let usedFallback = false;
 
     let resolved = false;
     let output = "";
 
     const parseAuthUrl = (text) => {
-      const match = text.match(/https:\/\/login\.tailscale\.com\/a\/[a-zA-Z0-9]+/);
-      return match ? match[0] : null;
+      const patterns = [
+        /https:\/\/login\.tailscale\.com\/a\/[a-zA-Z0-9]+/,
+        /https:\/\/[^\s]*tailscale\.com\/a\/[a-zA-Z0-9]+/,
+      ];
+      for (const re of patterns) {
+        const match = text.match(re);
+        if (match) return match[0];
+      }
+      return null;
     };
 
     const finishWithUrl = (url, source) => {
@@ -675,11 +821,58 @@ export function startLogin(hostname) {
       clearTimeout(timeout);
       clearInterval(statusPoll);
       console.log(`[Tailscale] login authUrl detected (${source})`);
-      child.unref();
+      child?.unref?.();
       resolve({ authUrl: url });
     };
 
-    // Poll status --json every 500ms — Windows exposes AuthURL only there
+    const handleData = (data) => {
+      output += data.toString();
+      const url = parseAuthUrl(output);
+      if (url) finishWithUrl(url, "stdout");
+    };
+
+    const attachStreams = (proc) => {
+      proc.stdout.on("data", handleData);
+      proc.stderr.on("data", handleData);
+      proc.on("error", (err) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeout);
+        clearInterval(statusPoll);
+        console.error(`[Tailscale] login spawn error: ${err.message}`);
+        reject(err);
+      });
+      proc.on("exit", (code) => {
+        if (resolved) return;
+        console.log(`[Tailscale] login exit code=${code} cmd=${usedFallback ? "up" : "login"}`);
+        const url = parseAuthUrl(output) || getAuthUrlFromStatus();
+        if (url) {
+          finishWithUrl(url, "exit");
+          return;
+        }
+        if (!usedFallback) {
+          usedFallback = true;
+          output += `\n[fallback] trying tailscale up --reset\n`;
+          child = spawn(bin, upCmdArgs, {
+            stdio: ["ignore", "pipe", "pipe"],
+            detached: true,
+            windowsHide: true
+          });
+          attachStreams(child);
+          return;
+        }
+        if (isTailscaleLoggedIn()) {
+          resolved = true;
+          clearTimeout(timeout);
+          clearInterval(statusPoll);
+          resolve({ alreadyLoggedIn: true });
+          return;
+        }
+        // Otherwise keep polling — daemon may publish AuthURL shortly after exit
+      });
+    };
+
+    // Poll status --json every 500ms — AuthURL often only lands in status.
     const statusPoll = setInterval(() => {
       if (resolved) return;
       const url = getAuthUrlFromStatus();
@@ -690,63 +883,28 @@ export function startLogin(hostname) {
       if (resolved) return;
       resolved = true;
       clearInterval(statusPoll);
-      child.unref();
+      child?.unref?.();
       const url = parseAuthUrl(output) || getAuthUrlFromStatus();
       if (url) resolve({ authUrl: url });
       else reject(new Error("tailscale up timed out without auth URL"));
-    }, 15000);
+    }, 30000);
 
-    const handleData = (data) => {
-      output += data.toString();
-      const url = parseAuthUrl(output);
-      if (url) finishWithUrl(url, "stdout");
-    };
-
-    child.stdout.on("data", handleData);
-    child.stderr.on("data", handleData);
-
-    child.on("error", (err) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timeout);
-      clearInterval(statusPoll);
-      console.error(`[Tailscale] login spawn error: ${err.message}`);
-      reject(err);
-    });
-
-    child.on("exit", (code) => {
-      if (resolved) return;
-      console.log(`[Tailscale] login exit code=${code}`);
-      // Don't trust exit code alone — Win `tailscale up` exits 0 even when not logged in.
-      // Let status poll continue until AuthURL appears or timeout.
-      const url = parseAuthUrl(output) || getAuthUrlFromStatus();
-      if (url) {
-        finishWithUrl(url, "exit");
-        return;
-      }
-      // Only resolve alreadyLoggedIn if status confirms BackendState=Running
-      if (isTailscaleLoggedIn()) {
-        resolved = true;
-        clearTimeout(timeout);
-        clearInterval(statusPoll);
-        resolve({ alreadyLoggedIn: true });
-        return;
-      }
-      // Otherwise keep polling — daemon may publish AuthURL shortly after exit
-    });
+    attachStreams(child);
   });
 }
 
-/** Start tailscale funnel for the given port */
+/** Start tailscale funnel for the given port on the live backend */
 export async function startFunnel(port) {
   const bin = getTailscaleBin();
   if (!bin) throw new Error("Tailscale not installed");
 
+  const socketArgs = await getActiveTailscaleSocketArgs({ force: true });
+
   // Reset any existing funnel
-  try { execSync(`"${bin}" ${SOCKET_FLAG.join(" ")} funnel --bg reset`, { stdio: "ignore", windowsHide: true }); } catch (e) { /* ignore */ }
+  try { execSync(cmdWithSocket(bin, socketArgs, "funnel", "--bg", "reset"), { stdio: "ignore", windowsHide: true }); } catch (e) { /* ignore */ }
 
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, tsArgs("funnel", "--bg", `${port}`), {
+    const child = spawn(bin, [...socketArgs, "funnel", "--bg", `${port}`], {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true
     });
@@ -823,9 +981,10 @@ export async function provisionCert(hostname) {
   fs.mkdirSync(certsDir, { recursive: true });
   const certFile = path.join(certsDir, `${hostname}.crt`);
   const keyFile = path.join(certsDir, `${hostname}.key`);
+  const socketArgs = await getActiveTailscaleSocketArgs();
   try {
     await execAsync(
-      `"${bin}" ${SOCKET_FLAG.join(" ")} cert --cert-file "${certFile}" --key-file "${keyFile}" "${hostname}"`,
+      cmdWithSocket(bin, socketArgs, "cert", "--cert-file", `"${certFile}"`, "--key-file", `"${keyFile}"`, `"${hostname}"`),
       { windowsHide: true, env: { ...process.env, PATH: EXTENDED_PATH }, timeout: 30000 }
     );
     console.log(`[Tailscale] cert provisioned for ${hostname}`);
@@ -834,11 +993,20 @@ export async function provisionCert(hostname) {
   }
 }
 
-/** Stop tailscale funnel */
+/** Stop tailscale funnel on the live backend */
 export function stopFunnel() {
   const bin = getTailscaleBin();
   if (!bin) return;
-  try { execSync(`"${bin}" ${SOCKET_FLAG.join(" ")} funnel --bg reset`, { stdio: "ignore", windowsHide: true }); } catch (e) { /* ignore */ }
+  const backend = activeBackendCache.value;
+  const candidates = backend?.socketArgs !== undefined
+    ? [backend.socketArgs]
+    : [SOCKET_FLAG, [], SYSTEM_SOCKET_FLAG];
+  for (const socketArgs of candidates) {
+    try {
+      execSync(cmdWithSocket(bin, socketArgs, "funnel", "--bg", "reset"), { stdio: "ignore", windowsHide: true });
+      return;
+    } catch { /* try next backend */ }
+  }
 }
 
 /** Kill tailscaled daemon (runs as root, needs sudo) */

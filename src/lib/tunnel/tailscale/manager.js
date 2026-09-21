@@ -1,5 +1,5 @@
 import { loadState, generateShortId } from "../shared/state.js";
-import { startFunnel, stopFunnel, isTailscaleRunning, isTailscaleRunningStrict, isTailscaleLoggedIn, isTailscaleLoggedInStrict, startLogin, startDaemonWithPassword, provisionCert } from "./tailscale.js";
+import { startFunnel, stopFunnel, isTailscaleRunning, isTailscaleRunningStrict, isTailscaleLoggedIn, isTailscaleLoggedInStrict, startLogin, startDaemonWithPassword, provisionCert, probeTailscaleStatus } from "./tailscale.js";
 import { waitForHealth } from "./healthCheck.js";
 import { getSettings, updateSettings } from "@/lib/localDb";
 import { getCachedPassword, loadEncryptedPassword, initDbHooks } from "@/mitm/manager";
@@ -29,8 +29,18 @@ export async function enableTailscale(localPort = 20128) {
 
   try {
     const sudoPass = getCachedPassword() || await loadEncryptedPassword() || "";
-    await startDaemonWithPassword(sudoPass);
-    console.log("[Tailscale] daemon ready");
+
+    // Prefer the live backend (macOS Tailscale.app / system service). Only spawn
+    // a custom daemon when nothing is online — forcing a dead custom socket was
+    // what produced "tailscale up timed out without auth URL".
+    const pre = await probeTailscaleStatus({ force: true });
+    console.log(`[Tailscale] pre-probe backend=${pre.backend} loggedIn=${pre.loggedIn}`);
+    if (!pre.loggedIn) {
+      await startDaemonWithPassword(sudoPass);
+      console.log("[Tailscale] daemon/backend ready");
+    } else {
+      console.log(`[Tailscale] reusing existing backend=${pre.backend}`);
+    }
     throwIfCancelled(token);
 
     const existing = loadState();

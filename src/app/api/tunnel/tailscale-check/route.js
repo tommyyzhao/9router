@@ -2,7 +2,7 @@ import os from "os";
 import { exec } from "child_process";
 import { promisify } from "util";
 import { NextResponse } from "next/server";
-import { isTailscaleInstalled, isTailscaleLoggedIn, isSystemDaemonRunning, getTailscaleBin, TAILSCALE_SOCKET } from "@/lib/tunnel";
+import { isTailscaleInstalled, isTailscaleLoggedIn, isSystemDaemonRunning, isDefaultCliBackendAlive, probeTailscaleStatus, getTailscaleBin, TAILSCALE_SOCKET } from "@/lib/tunnel";
 import { getCachedPassword, loadEncryptedPassword } from "@/mitm/manager";
 
 const execAsync = promisify(exec);
@@ -28,7 +28,7 @@ async function isCustomDaemonRunning() {
     return true;
   } catch {
     try {
-      await execAsync("pgrep -x tailscaled", { windowsHide: true, timeout: PROBE_TIMEOUT_MS });
+      await execAsync("pgrep -x tailscaled || pgrep -f 'tailscale.ipn|macsys.network-extension'", { windowsHide: true, timeout: PROBE_TIMEOUT_MS });
       return true;
     } catch { return false; }
   }
@@ -38,16 +38,29 @@ export async function GET() {
   try {
     const installed = isTailscaleInstalled();
     const platform = os.platform();
-    // Run independent probes in parallel — none blocks the event loop
-    const [brewAvailable, customDaemonRunning, systemDaemonRunning] = await Promise.all([
+    // Independent probes — include default CLI backend (macOS Tailscale.app has no /var/run sock).
+    const [brewAvailable, customDaemonRunning, systemDaemonRunning, defaultCliAlive, probe] = await Promise.all([
       platform === "darwin" ? hasBrew() : Promise.resolve(false),
       installed ? isCustomDaemonRunning() : Promise.resolve(false),
       installed ? Promise.resolve(isSystemDaemonRunning()) : Promise.resolve(false),
+      installed ? isDefaultCliBackendAlive() : Promise.resolve(false),
+      installed ? probeTailscaleStatus({ force: true }) : Promise.resolve({ backend: null, loggedIn: false }),
     ]);
-    const daemonRunning = customDaemonRunning || systemDaemonRunning;
-    const loggedIn = daemonRunning ? isTailscaleLoggedIn() : false;
+    const daemonRunning = customDaemonRunning || systemDaemonRunning || defaultCliAlive || !!probe.backend;
+    const loggedIn = probe.loggedIn || (daemonRunning ? isTailscaleLoggedIn() : false);
     const hasCachedPassword = !!(getCachedPassword() || await loadEncryptedPassword());
-    return NextResponse.json({ installed, loggedIn, platform, brewAvailable, daemonRunning, customDaemonRunning, systemDaemonRunning, hasCachedPassword });
+    return NextResponse.json({
+      installed,
+      loggedIn,
+      platform,
+      brewAvailable,
+      daemonRunning,
+      customDaemonRunning,
+      systemDaemonRunning: systemDaemonRunning || defaultCliAlive,
+      defaultCliAlive,
+      backend: probe.backend || null,
+      hasCachedPassword,
+    });
   } catch (error) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
