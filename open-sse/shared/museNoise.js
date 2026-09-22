@@ -328,7 +328,10 @@ export function decServiceFrame(buf) {
   const f = readFields(buf);
   const kinds = { 2: "request", 3: "response", 4: "bodyChunk", 5: "reset" };
   for (const [fn, k] of Object.entries(kinds)) {
-    if (f[fn]) return { streamId: BigInt(readVarint(f[1][0], 0)[0]), kind: k, payload: f[fn][0] };
+    if (f[fn]) {
+      const streamId = f[1] ? BigInt(readVarint(f[1][0], 0)[0]) : 0n;
+      return { streamId, kind: k, payload: f[fn][0] };
+    }
   }
   throw new Error("unknown service frame kind");
 }
@@ -577,6 +580,11 @@ export class HatchNoiseClient {
   _onServicePayload(payload) {
     const svc = decServiceResponse(payload);
     const frame = decServiceFrame(svc.payload);
+    if (frame.kind === "reset" && frame.streamId === 0n) {
+      const reason = frame.payload?.toString("utf8").replace(/[\x00-\x1f\x7f]/g, " ").trim();
+      this._failPending(new Error(reason ? `Muse gateway reset the connection: ${reason.slice(0, 160)}` : "Muse gateway reset the connection"));
+      return;
+    }
     const entry = this.pending.get(frame.streamId.toString());
     if (!entry) return;
     if (frame.kind === "response") {
@@ -624,8 +632,8 @@ export class HatchNoiseClient {
     try { entry.onDone?.(); } catch { /* ignore callback errors */ }
   }
 
-  _sendServiceFrame(streamId, kind, payload) {
-    const frame = encServiceFrame(streamId, kind, payload);
+  _sendServiceFrame(streamId, kind, payload, service = ServiceType.DAEMON) {
+    const frame = encServiceRequest(service, encServiceFrame(streamId, kind, payload));
     const chunks = [];
     for (let i = 0; i < frame.length; i += MAX_PAYLOAD_CHUNK) chunks.push(frame.subarray(i, i + MAX_PAYLOAD_CHUNK));
     if (!chunks.length) chunks.push(Buffer.alloc(0));
@@ -654,10 +662,11 @@ export class HatchNoiseClient {
       onRecord: opts.onRecord,
       onError: opts.onError,
       onDone: opts.onDone,
+      service: opts.service ?? ServiceType.DAEMON,
     };
     this.pending.set(streamId.toString(), entry);
     entry.abortHandler = () => {
-      try { if (this.ws && this.sendCipher) this._sendServiceFrame(streamId, "reset", Buffer.alloc(0)); } catch { /* ignore reset failures */ }
+      try { if (this.ws && this.sendCipher) this._sendServiceFrame(streamId, "reset", Buffer.alloc(0), entry.service); } catch { /* ignore reset failures */ }
       this._fail(entry, streamId, new Error("aborted"));
     };
     if (opts.signal?.aborted) {
@@ -672,9 +681,8 @@ export class HatchNoiseClient {
       Object.entries(opts.headers || {}).map(([key, value]) => ({ key, value: String(value) })),
       body,
     );
-    const svcReq = encServiceRequest(opts.service ?? ServiceType.DAEMON, req);
     try {
-      if (!entry.done) this._sendServiceFrame(streamId, "request", svcReq);
+      if (!entry.done) this._sendServiceFrame(streamId, "request", req, entry.service);
     } catch (error) {
       this._fail(entry, streamId, error);
       throw error;

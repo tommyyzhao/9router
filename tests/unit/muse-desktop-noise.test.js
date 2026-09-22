@@ -146,6 +146,12 @@ describe("muse protobuf framing", () => {
     }
   });
 
+  it("parses connection reset frames without a stream id", () => {
+    const dec = decServiceFrame(new Writer().message(5, Buffer.from("reset")).finish());
+    expect(dec).toMatchObject({ streamId: 0n, kind: "reset" });
+    expect(dec.payload.toString()).toBe("reset");
+  });
+
   it("round-trips ApplicationRequest/Response", () => {
     const req = encApplicationRequest("POST", "/chat/stream",
       [{ key: "x-app-id", value: "hatch-web" }], Buffer.from("{}"));
@@ -161,6 +167,18 @@ describe("muse protobuf framing", () => {
     expect(dec.headers).toEqual([{ key: "content-type", value: "application/json" }]);
     expect(dec.body.toString()).toBe('{"ok":true}');
     expect(dec.endBody).toBe(true);
+  });
+
+  it("wraps outgoing frames in the service request envelope", () => {
+    const application = encApplicationRequest("POST", "/chat/stream", [], Buffer.from("{}"));
+    const frame = encServiceFrame(1n, "request", application);
+    const outer = encServiceRequest(ServiceType.DAEMON, frame);
+    const fields = readFields(outer);
+    expect(Number(readVarint(fields[1][0], 0)[0])).toBe(ServiceType.DAEMON);
+    const nested = decServiceFrame(fields[2][0]);
+    expect(nested.streamId).toBe(1n);
+    expect(nested.kind).toBe("request");
+    expect(readFields(nested.payload)[1][0].toString()).toBe("POST");
   });
 
   it("round-trips ServiceRequest + BodyChunk", () => {
@@ -222,6 +240,18 @@ describe("muse transport regressions", () => {
     expect(errors[0].status).toBe(429);
     expect(errors[0].message).toContain("429");
     expect(records).toEqual([]);
+  });
+
+  it("fails all pending requests on a stream-zero reset", () => {
+    const errors = [];
+    const client = new HatchNoiseClient();
+    client.pending.set("1", { textBuf: "", done: false, onError: (error) => errors.push(error) });
+    client.pending.set("2", { textBuf: "", done: false, onError: (error) => errors.push(error) });
+    const service = new Writer().bytes(1, new Writer().message(5, Buffer.from("reserved stream id")).finish()).finish();
+    client._onServicePayload(service);
+    expect(client.pending.size).toBe(0);
+    expect(errors).toHaveLength(2);
+    expect(errors[0].message).toContain("reserved stream id");
   });
 
   it("rejects pending requests when the gateway closes", () => {
