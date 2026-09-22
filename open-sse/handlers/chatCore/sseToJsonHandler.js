@@ -190,11 +190,11 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
   if (!isSSE && isJson && isResponsesProvider(provider)) {
     try {
       const jsonResponse = await providerResponse.json();
-      if (jsonResponse.status === "failed" || jsonResponse.status === "incomplete" || jsonResponse.error) {
+      if (jsonResponse.status === "failed" || jsonResponse.error) {
         appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
         return createErrorResult(
           HTTP_STATUS.BAD_GATEWAY,
-          jsonResponse.error?.message || `Upstream Responses stream ${jsonResponse.status || "failed"}`
+          jsonResponse.error?.message || "Upstream Responses stream failed"
         );
       }
       if (onRequestSuccess) await onRequestSuccess();
@@ -256,7 +256,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
   if (isCodexResponsesApi) {
     try {
       const jsonResponse = await convertResponsesStreamToJson(providerResponse.body);
-      if (jsonResponse.status === "failed" || jsonResponse.status === "incomplete" || jsonResponse.error) {
+      if (jsonResponse.status === "failed" || jsonResponse.error) {
         appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
         return createErrorResult(
           HTTP_STATUS.BAD_GATEWAY,

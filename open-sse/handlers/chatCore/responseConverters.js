@@ -1,5 +1,5 @@
 import { FORMATS } from "../../translator/formats.js";
-import { CLAUDE_BLOCK, OPENAI_BLOCK, RESPONSES_ITEM, ROLE } from "../../translator/schema/index.js";
+import { CLAUDE_BLOCK, OPENAI_BLOCK, RESPONSES_ITEM, ROLE, OPENAI_FINISH } from "../../translator/schema/index.js";
 import { fromOpenAIFinish } from "../../translator/concerns/finishReason.js";
 
 function parseToolArguments(value) {
@@ -36,6 +36,7 @@ export function responsesToOpenAICompletion(responseBody, fallbackModel) {
   const textParts = [];
   const reasoningParts = [];
   const toolCalls = [];
+  const includeToolCalls = responseBody.status !== "incomplete";
   for (const item of responseBody.output) {
     if (item?.type === RESPONSES_ITEM.MESSAGE) {
       const text = responseItemText(item);
@@ -43,7 +44,7 @@ export function responsesToOpenAICompletion(responseBody, fallbackModel) {
     } else if (item?.type === RESPONSES_ITEM.REASONING) {
       const reasoning = responseItemReasoning(item);
       if (reasoning) reasoningParts.push(reasoning);
-    } else if (item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL) {
+    } else if (includeToolCalls && (item?.type === RESPONSES_ITEM.FUNCTION_CALL || item?.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL)) {
       const custom = item.type === RESPONSES_ITEM.CUSTOM_TOOL_CALL;
       const rawArguments = custom
         ? (typeof item.input === "string" ? { input: item.input } : item.input || {})
@@ -86,8 +87,11 @@ export function responsesToOpenAICompletion(responseBody, fallbackModel) {
 
   const status = responseBody.status;
   const finishReason = toolCalls.length > 0
-    ? "tool_calls"
-    : (status === "completed" || status === "done" ? "stop" : (status || "stop"));
+    ? OPENAI_FINISH.TOOL_CALLS
+    : (status === "completed" || status === "done" ? OPENAI_FINISH.STOP
+      : (status === "incomplete" && responseBody.incomplete_details?.reason === "max_output_tokens"
+        ? OPENAI_FINISH.LENGTH
+        : (status || OPENAI_FINISH.STOP)));
   return {
     id: responseBody.id || `chatcmpl-${Date.now()}`,
     object: "chat.completion",

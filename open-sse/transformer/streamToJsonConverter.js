@@ -27,9 +27,13 @@ function processSSEMessage(msg, state) {
     state.created = parsed.response?.created_at || state.created;
   } else if (eventType === "response.output_item.done") {
     state.items.set(parsed.output_index ?? 0, parsed.item);
-  } else if (eventType === "response.completed" || eventType === "response.done") {
-    state.status = "completed";
+  } else if (eventType === "response.completed" || eventType === "response.done" || eventType === "response.incomplete") {
+    const incomplete = eventType === "response.incomplete" || parsed.response?.status === "incomplete" || parsed.status === "incomplete";
+    state.status = incomplete ? "incomplete" : "completed";
     state.terminal = true;
+    state.incomplete_details = incomplete
+      ? (parsed.response?.incomplete_details || parsed.incomplete_details || null)
+      : undefined;
     if (parsed.response?.id) state.responseId = parsed.response.id;
     if (parsed.response?.created_at) state.created = parsed.response.created_at;
     if (parsed.response?.usage) {
@@ -128,6 +132,7 @@ export async function convertResponsesStreamToJson(stream) {
     created_at: state.created,
     status: state.status || "completed",
     error: state.error,
+    ...(state.incomplete_details ? { incomplete_details: state.incomplete_details } : {}),
     output,
     usage: state.usage
   };

@@ -250,6 +250,120 @@ describe("forced-SSE failures", () => {
   });
 });
 
+describe("incomplete Responses responses", () => {
+  const incompletePayload = (status = "incomplete") => ({
+    id: "resp-incomplete",
+    object: "response",
+    status,
+    incomplete_details: { reason: "max_output_tokens" },
+    model: "gpt-x",
+    output: [
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "partial" }] },
+      { type: "function_call", call_id: "partial_call", name: "shell", arguments: '{"cmd":"partial"}' }
+    ],
+    usage: { input_tokens: 8, output_tokens: 10, total_tokens: 18 }
+  });
+
+  it("preserves incomplete Responses JSON for a native Responses client", async () => {
+    const payload = incompletePayload();
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } }),
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "meta",
+      model: "gpt-x",
+      body: { model: "gpt-x", stream: false },
+      stream: true,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/responses" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    await expect(result.response.json()).resolves.toMatchObject({
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: payload.output,
+      usage: payload.usage
+    });
+  });
+
+  it("maps max_output_tokens to Claude max_tokens without partial tool execution", async () => {
+    const payload = incompletePayload();
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } }),
+      sourceFormat: FORMATS.CLAUDE,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "meta",
+      model: "gpt-x",
+      body: { model: "gpt-x", messages: [] },
+      stream: false,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/messages" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.stop_reason).toBe("max_tokens");
+    expect(json.content).toEqual([{ type: "text", text: "partial" }]);
+  });
+
+  const incompleteSse = () => [
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "partial" }] } })}`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 1, item: { type: "function_call", call_id: "partial_call", name: "shell", arguments: '{"cmd":"partial"}' } })}`,
+    `event: response.incomplete\ndata: ${JSON.stringify({ type: "response.incomplete", response: { id: "resp-sse-incomplete", status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: { input_tokens: 8, output_tokens: 10, total_tokens: 18 } } })}`,
+    ""
+  ].join("\n\n");
+
+  it("preserves incomplete Responses SSE for a native Responses client", async () => {
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(incompleteSse(), { headers: { "content-type": "text/event-stream" } }),
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "codex",
+      model: "gpt-x",
+      body: { model: "gpt-x", stream: false },
+      stream: true,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/responses" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    await expect(result.response.json()).resolves.toMatchObject({
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [{ type: "message", content: [{ type: "output_text", text: "partial" }] }, { type: "function_call" }],
+      usage: { input_tokens: 8, output_tokens: 10, total_tokens: 18 }
+    });
+  });
+
+  it("converts an incomplete Responses SSE to Claude without tool blocks", async () => {
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(incompleteSse(), { headers: { "content-type": "text/event-stream" } }),
+      sourceFormat: FORMATS.CLAUDE,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "codex",
+      model: "gpt-x",
+      body: { model: "gpt-x", messages: [] },
+      stream: false,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/messages" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.stop_reason).toBe("max_tokens");
+    expect(json.content).toEqual([{ type: "text", text: "partial" }]);
+  });
+});
+
 describe("forceStream provider that returns JSON instead of SSE", () => {
   it("returns the Responses JSON body to a Responses client", async () => {
     const payload = {
