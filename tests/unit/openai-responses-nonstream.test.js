@@ -124,6 +124,34 @@ describe("forced-SSE JSON path for a Responses-API client behind a chat upstream
     expect(fc.arguments).toBe("{\"cmd\":\"pwd\"}");
   });
 
+  it("converts a Responses SSE aggregate to Claude Messages", async () => {
+    const encoder = new TextEncoder();
+    const raw = [
+      `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp-claude", created_at: 1700000000 } })}`,
+      `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { type: "reasoning", summary: [{ type: "summary_text", text: "reason" }] } })}`,
+      `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 1, item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "hello" }] } })}`,
+      `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 2, item: { type: "function_call", call_id: "call_r", name: "shell", arguments: '{"cmd":"ls"}' } })}`,
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp-claude", status: "completed", usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11, input_tokens_details: { cached_tokens: 5 } } } })}`,
+      ""
+    ].join("\n\n");
+    const result = await handleForcedSSEToJson({
+      ...sseCtx(FORMATS.CLAUDE, FORMATS.OPENAI_RESPONSES),
+      provider: "codex",
+      providerResponse: new Response(new ReadableStream({
+        start(controller) { controller.enqueue(encoder.encode(raw)); controller.close(); }
+      }), { headers: { "content-type": "text/event-stream" } })
+    });
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.type).toBe("message");
+    expect(json.content).toEqual([
+      { type: "thinking", thinking: "reason" },
+      { type: "text", text: "hello" },
+      { type: "tool_use", id: "call_r", name: "shell", input: { cmd: "ls" } }
+    ]);
+    expect(json.usage).toEqual({ input_tokens: 3, output_tokens: 3, cache_read_input_tokens: 5 });
+  });
+
   it("returns a custom_tool_call for a marked tool", async () => {
     const ctx = sseCtx(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI);
     ctx.customToolNames = new Set(["shell"]);
@@ -144,6 +172,250 @@ describe("forced-SSE JSON path for a Responses-API client behind a chat upstream
     const json = await result.response.json();
     expect(json.object).toBe("chat.completion");
     expect(json.choices[0].message.tool_calls[0].function.name).toBe("shell");
+  });
+
+  it("converts chat SSE text, reasoning, tools, and cache usage to Claude Messages", async () => {
+    const encoder = new TextEncoder();
+    const raw = [
+      'data: {"id":"chatcmpl-claude","model":"gpt-x","choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}',
+      'data: {"id":"chatcmpl-claude","model":"gpt-x","choices":[{"delta":{"content":"answer"},"finish_reason":null}]}',
+      'data: {"id":"chatcmpl-claude","model":"gpt-x","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_c","type":"function","function":{"name":"shell","arguments":"{\\"cmd\\":\\"pwd\\"}"}}]},"finish_reason":null}]}',
+      'data: {"id":"chatcmpl-claude","model":"gpt-x","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":110,"completion_tokens":7,"total_tokens":117,"prompt_tokens_details":{"cached_tokens":100}}}',
+      "data: [DONE]",
+      ""
+    ].join("\n\n");
+    const result = await handleForcedSSEToJson({
+      ...sseCtx(FORMATS.CLAUDE, FORMATS.OPENAI),
+      providerResponse: new Response(new ReadableStream({
+        start(controller) { controller.enqueue(encoder.encode(raw)); controller.close(); }
+      }), { headers: { "content-type": "text/event-stream" } })
+    });
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.type).toBe("message");
+    expect(json.stop_reason).toBe("tool_use");
+    expect(json.content).toEqual([
+      { type: "thinking", thinking: "think" },
+      { type: "text", text: "answer" },
+      { type: "tool_use", id: "call_c", name: "shell", input: { cmd: "pwd" } }
+    ]);
+    expect(json.usage).toEqual({ input_tokens: 10, output_tokens: 7, cache_read_input_tokens: 100 });
+  });
+});
+
+describe("forced-SSE failures", () => {
+  const errorCtx = (overrides = {}) => ({
+    sourceFormat: FORMATS.CLAUDE,
+    targetFormat: FORMATS.OPENAI_RESPONSES,
+    provider: "codex",
+    model: "gpt-x",
+    body: { model: "gpt-x", messages: [] },
+    stream: false,
+    requestStartTime: Date.now(),
+    connectionId: "test-connection",
+    clientRawRequest: { endpoint: "/v1/messages" },
+    trackDone: vi.fn(),
+    appendLog: vi.fn(),
+    ...overrides
+  });
+
+  it("does not run success callbacks or accounting for terminal Responses errors", async () => {
+    const onRequestSuccess = vi.fn();
+    const appendLog = vi.fn();
+    const payload = [
+      `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: { id: "resp-fail", error: { message: "quota" } } })}`,
+      ""
+    ].join("\n\n");
+    const result = await handleForcedSSEToJson(errorCtx({
+      onRequestSuccess,
+      appendLog,
+      providerResponse: new Response(payload, { headers: { "content-type": "text/event-stream" } })
+    }));
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(502);
+    expect(onRequestSuccess).not.toHaveBeenCalled();
+    expect(appendLog).toHaveBeenCalledWith({ status: "FAILED 502" });
+  });
+
+  it("treats a Responses stream without a terminal event as failed", async () => {
+    const raw = [
+      `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp-incomplete" } })}`,
+      ""
+    ].join("\n\n");
+    const result = await handleForcedSSEToJson(errorCtx({
+      providerResponse: new Response(raw, { headers: { "content-type": "text/event-stream" } })
+    }));
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(502);
+  });
+});
+
+describe("incomplete Responses responses", () => {
+  const topLevelCacheUsage = { input_tokens: 3, output_tokens: 1, total_tokens: 9, cache_read_input_tokens: 5, cache_creation_input_tokens: 1 };
+
+  const incompletePayload = (status = "incomplete") => ({
+    id: "resp-incomplete",
+    object: "response",
+    status,
+    incomplete_details: { reason: "max_output_tokens" },
+    model: "gpt-x",
+    output: [
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "partial" }] },
+      { type: "function_call", call_id: "partial_call", name: "shell", arguments: '{"cmd":"partial"}' }
+    ],
+    usage: { input_tokens: 8, output_tokens: 10, total_tokens: 18 }
+  });
+
+  it("preserves top-level cache read/create counters for Claude JSON", async () => {
+    const payload = {
+      id: "resp-cache-json",
+      object: "response",
+      status: "completed",
+      model: "gpt-x",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "cached" }] }],
+      usage: topLevelCacheUsage
+    };
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } }),
+      sourceFormat: FORMATS.CLAUDE,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "meta",
+      model: "gpt-x",
+      body: { model: "gpt-x", messages: [] },
+      stream: false,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/messages" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.usage).toEqual({ input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 5, cache_creation_input_tokens: 1 });
+  });
+
+  it("preserves incomplete Responses JSON for a native Responses client", async () => {
+    const payload = incompletePayload();
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } }),
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "meta",
+      model: "gpt-x",
+      body: { model: "gpt-x", stream: false },
+      stream: true,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/responses" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    await expect(result.response.json()).resolves.toMatchObject({
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: payload.output,
+      usage: payload.usage
+    });
+  });
+
+  it("maps max_output_tokens to Claude max_tokens without partial tool execution", async () => {
+    const payload = incompletePayload();
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } }),
+      sourceFormat: FORMATS.CLAUDE,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "meta",
+      model: "gpt-x",
+      body: { model: "gpt-x", messages: [] },
+      stream: false,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/messages" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.stop_reason).toBe("max_tokens");
+    expect(json.content).toEqual([{ type: "text", text: "partial" }]);
+  });
+
+  const incompleteSse = () => [
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "partial" }] } })}`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 1, item: { type: "function_call", call_id: "partial_call", name: "shell", arguments: '{"cmd":"partial"}' } })}`,
+    `event: response.incomplete\ndata: ${JSON.stringify({ type: "response.incomplete", response: { id: "resp-sse-incomplete", status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, usage: { input_tokens: 8, output_tokens: 10, total_tokens: 18 } } })}`,
+    ""
+  ].join("\n\n");
+
+  it("preserves incomplete Responses SSE for a native Responses client", async () => {
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(incompleteSse(), { headers: { "content-type": "text/event-stream" } }),
+      sourceFormat: FORMATS.OPENAI_RESPONSES,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "codex",
+      model: "gpt-x",
+      body: { model: "gpt-x", stream: false },
+      stream: true,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/responses" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    await expect(result.response.json()).resolves.toMatchObject({
+      status: "incomplete",
+      incomplete_details: { reason: "max_output_tokens" },
+      output: [{ type: "message", content: [{ type: "output_text", text: "partial" }] }, { type: "function_call" }],
+      usage: { input_tokens: 8, output_tokens: 10, total_tokens: 18 }
+    });
+  });
+
+  it("preserves top-level cache read/create counters for Claude SSE", async () => {
+    const events = [
+      `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "cached" }] } })}`,
+      `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp-cache-sse", status: "completed", usage: topLevelCacheUsage } })}`,
+      ""
+    ].join("\n\n");
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(events, { headers: { "content-type": "text/event-stream" } }),
+      sourceFormat: FORMATS.CLAUDE,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "codex",
+      model: "gpt-x",
+      body: { model: "gpt-x", messages: [] },
+      stream: false,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/messages" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.usage).toEqual({ input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 5, cache_creation_input_tokens: 1 });
+  });
+
+  it("converts an incomplete Responses SSE to Claude without tool blocks", async () => {
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(incompleteSse(), { headers: { "content-type": "text/event-stream" } }),
+      sourceFormat: FORMATS.CLAUDE,
+      targetFormat: FORMATS.OPENAI_RESPONSES,
+      provider: "codex",
+      model: "gpt-x",
+      body: { model: "gpt-x", messages: [] },
+      stream: false,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/messages" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn(),
+    });
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.stop_reason).toBe("max_tokens");
+    expect(json.content).toEqual([{ type: "text", text: "partial" }]);
   });
 });
 

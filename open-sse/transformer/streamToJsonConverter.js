@@ -27,15 +27,43 @@ function processSSEMessage(msg, state) {
     state.created = parsed.response?.created_at || state.created;
   } else if (eventType === "response.output_item.done") {
     state.items.set(parsed.output_index ?? 0, parsed.item);
-  } else if (eventType === "response.completed" || eventType === "response.done") {
-    state.status = "completed";
+  } else if (eventType === "response.completed" || eventType === "response.done" || eventType === "response.incomplete") {
+    const incomplete = eventType === "response.incomplete" || parsed.response?.status === "incomplete" || parsed.status === "incomplete";
+    state.status = incomplete ? "incomplete" : "completed";
+    state.terminal = true;
+    state.incomplete_details = incomplete
+      ? (parsed.response?.incomplete_details || parsed.incomplete_details || null)
+      : undefined;
+    if (parsed.response?.id) state.responseId = parsed.response.id;
+    if (parsed.response?.created_at) state.created = parsed.response.created_at;
     if (parsed.response?.usage) {
-      state.usage.input_tokens = parsed.response.usage.input_tokens || 0;
-      state.usage.output_tokens = parsed.response.usage.output_tokens || 0;
-      state.usage.total_tokens = parsed.response.usage.total_tokens || 0;
+      const usage = parsed.response.usage;
+      state.usage.input_tokens = usage.input_tokens || 0;
+      state.usage.output_tokens = usage.output_tokens || 0;
+      state.usage.total_tokens = usage.total_tokens || (state.usage.input_tokens + state.usage.output_tokens);
+      if (usage.input_tokens_details?.cached_tokens !== undefined) {
+        state.usage.cached_tokens = usage.input_tokens_details.cached_tokens;
+      }
+      if (usage.cache_read_input_tokens !== undefined) {
+        state.usage.cache_read_input_tokens = usage.cache_read_input_tokens;
+      }
+      if (usage.cache_creation_input_tokens !== undefined) {
+        state.usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+      }
+      if (usage.output_tokens_details?.reasoning_tokens !== undefined) {
+        state.usage.reasoning_tokens = usage.output_tokens_details.reasoning_tokens;
+      }
     }
   } else if (eventType === "response.failed") {
     state.status = "failed";
+    state.terminal = true;
+    state.error = parsed.response?.error || parsed.error || null;
+    if (parsed.response?.id) state.responseId = parsed.response.id;
+    if (parsed.response?.created_at) state.created = parsed.response.created_at;
+  } else if (eventType === "error") {
+    state.status = "failed";
+    state.terminal = true;
+    state.error = parsed.error || parsed;
   }
 }
 
@@ -59,6 +87,7 @@ export async function convertResponsesStreamToJson(stream) {
     responseId: "",
     created: Math.floor(Date.now() / 1000),
     status: "in_progress",
+    terminal: false,
     usage: { ...EMPTY_RESPONSE },
     items: new Map()
   };
@@ -85,6 +114,11 @@ export async function convertResponsesStreamToJson(stream) {
     reader.releaseLock();
   }
 
+  if (!state.terminal) {
+    state.status = "failed";
+    state.error = state.error || { message: "Responses stream ended before a terminal event" };
+  }
+
   // Build output array from accumulated items (ordered by index)
   const output = [];
   const maxIndex = state.items.size > 0 ? Math.max(...state.items.keys()) : -1;
@@ -97,6 +131,8 @@ export async function convertResponsesStreamToJson(stream) {
     object: "response",
     created_at: state.created,
     status: state.status || "completed",
+    error: state.error,
+    ...(state.incomplete_details ? { incomplete_details: state.incomplete_details } : {}),
     output,
     usage: state.usage
   };
