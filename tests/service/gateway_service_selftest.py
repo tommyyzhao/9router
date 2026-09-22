@@ -75,9 +75,8 @@ def make_live_release(base: Path, name: str, behavior: str = "healthy") -> tuple
         "if(behavior==='prebind') process.exit(42);\n"
         "const server=http.createServer((req,res)=>{\n"
         " if(behavior==='hang') return;\n"
-        " res.writeHead(200,{'content-type':'application/json','connection':'keep-alive','keep-alive':'timeout=120'});res.end('{\\\"ok\\\":true}');\n"
+        " res.writeHead(200,{'content-type':'application/json'});res.end('{\\\"ok\\\":true}');\n"
         "});\n"
-        "server.keepAliveTimeout=120000;\n"
         "server.listen(port,'127.0.0.1',()=>{\n"
         " if(behavior==='crash') setTimeout(()=>process.exit(43),1000);\n"
         "});\n",
@@ -261,6 +260,7 @@ def offline_checks():
              patch.object(service, "stop_child", side_effect=service.ServiceError("stop denied")):
             service.rollback(store, store.read()["config"], "rollback test")
         assert "stop denied" in store.read()["diagnostic"]
+        assert store.read()["child"] == record and store.read()["phase"] == "degraded"
 
     # True supervisor startup readiness-stop failure retains persisted child.
     class StopSupervise(BaseException):
@@ -632,6 +632,7 @@ def installer_sigkill_checks(python: Path, node: Path, runtime_path: str):
 def maintenance_rehearsal_checks(python: Path, runtime_path: str):
     """Isolated old-supervisor replacement with proven parent and socket continuity."""
     import http.client
+    python_image = str((python.parent.parent / "Resources/Python.app/Contents/MacOS/Python").resolve(strict=True))
     with tempfile.TemporaryDirectory(prefix="9router-maintenance-") as raw:
         base = Path(raw).resolve()
         home = base / "home"
@@ -668,76 +669,260 @@ def maintenance_rehearsal_checks(python: Path, runtime_path: str):
         patched_bytes = SOURCE.read_bytes()
         baseline_bytes = subprocess.check_output(["git", "-C", str(ROOT), "show",
             "fac053ea2ec20dbfc44e519309eb4de86f86c7a9:scripts/service/gateway_service.py"])
+        service.atomic_write(original_script, baseline_bytes, original_script.stat().st_mode & 0o777)
         wrapper = base / "baseline-wrapper.py"
-        marker = base / "injected"
+        marker = base / "injected.json"
         maintenance = base / "ownership-maintenance.json"
+        loaded = base / "loaded.json"
+        readiness = base / "readiness.json"
+        captured = base / "captured.json"
         wrapper.write_text(
-            "import importlib.util,os,json,time;from pathlib import Path;"
-            f"source=Path({str(original_script)!r}); marker=Path({str(marker)!r}); maintenance=Path({str(maintenance)!r}); sd=Path({str(service_dir)!r});"
-            "spec=importlib.util.spec_from_file_location('baseline_service',source);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
-            "orig=m.monitor;\n"
+            "import os,json,hashlib,types,time\nfrom pathlib import Path\n"
+            f"source=Path({str(original_script)!r}); marker=Path({str(marker)!r}); sd=Path({str(service_dir)!r})\n"
+            "content=source.read_bytes();m=types.ModuleType('scratch_service');m.__file__=str(source)\n"
+            "exec(compile(content,str(source),'exec'),m.__dict__)\n"
+            f"m.atomic_write(Path({str(loaded)!r}),json.dumps(dict(pid=os.getpid(),sha256=hashlib.sha256(content).hexdigest())).encode())\n"
+            "orig=m.monitor; ready=m.wait_ready; start=m.start_selected; prove=m.prove_child\n"
+            "def prove_child(*args,**kwargs):\n"
+            " try: return prove(*args,**kwargs)\n"
+            " except m.ServiceError as e: print('prove failed',str(e),flush=True);raise\n"
+            "def start_selected(*args,**kwargs):\n"
+            " record=start(*args,**kwargs)\n"
+            f" m.atomic_write(Path({str(captured)!r}),json.dumps(record).encode())\n"
+            " return record\n"
             "def monitor(store,config,record):\n"
             " if not marker.exists():\n"
-            "  marker.write_text('inject');\n"
+            "  assert m.process_snapshot(record['pid'])['ppid']==os.getpid()\n"
             "  with store.locked() as s:\n"
-            "   maintenance.write_text(json.dumps({'child': s['child'], 'current': s['current'], 'qualified': s['qualified']}))\n"
+            "   assert s['child']==record\n"
+            "   m.atomic_write(marker,json.dumps(record).encode())\n"
             "   s['child']=None; s['phase']='degraded'\n"
             "  return\n"
             " return orig(store,config,record)\n"
-            "m.monitor=monitor;m.supervise(sd)\n", encoding="utf-8")
+            "def wait_ready(*args,**kwargs):\n"
+            " started=time.monotonic();print('ready started',args[0]['pid'],flush=True)\n"
+            " result=ready(*args,**kwargs)\n"
+            " print('ready finished',result,round(time.monotonic()-started,3),flush=True)\n"
+            f" m.atomic_write(Path({str(readiness)!r}),json.dumps(dict(pid=os.getpid(),successes=kwargs.get('successes',3),result=result)).encode())\n"
+            " return result\n"
+            "m.monitor=monitor;m.wait_ready=wait_ready;m.start_selected=start_selected;m.prove_child=prove_child;m.supervise(sd)\n", encoding="utf-8")
         payload = plistlib.loads(gateway_plist.read_bytes())
-        payload["ProgramArguments"] = [str(python), str(wrapper)]
-        gateway_plist.write_bytes(plistlib.dumps(payload))
-        jobs = [gateway_service]
-        keepalive = None
+        payload["ProgramArguments"] = [str(python), "-B", str(wrapper)]
+        service.atomic_write(gateway_plist, plistlib.dumps(payload))
+        final_plist = launch_agents / f"{label}.plist"
+        guard_plist = launch_agents / f"{guard_label}.plist"
+        service.atomic_write(final_plist, gateway_plist.read_bytes())
+        # Fixture starts already installed: guard must never run migration/bootout.
+        with store.locked() as state:
+            state["install_transaction"] = {"phase": "committed", "loaded": "stable",
+                "stable_plist": str(gateway_plist), "final_plist": str(final_plist)}
+            state["guard"]["stable_plist"] = str(final_plist)
+            state["config"]["startup_timeout"] = 45
+        jobs = [f"{domain}/{guard_label}", gateway_service]
+        child = None
+        helpers = []
+        witness_stop = threading.Event()
+        witness_ready = threading.Event()
+        witness_errors = []
+        samples = []
+        witness = None
+
+        def observe():
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            connection.auto_open = 0
+            try:
+                connection.connect()
+                sock = connection.sock
+                endpoint = sock.getsockname()
+                while True:
+                    connection.request("GET", "/api/health", headers={"Connection": "keep-alive"})
+                    response = connection.getresponse()
+                    assert response.status == 200 and json.loads(response.read())["ok"] is True
+                    assert connection.sock is sock and sock.getsockname() == endpoint
+                    samples.append((time.monotonic(), endpoint))
+                    witness_ready.set()
+                    if witness_stop.wait(1):
+                        break
+            except BaseException as error:
+                witness_errors.append(error)
+                witness_ready.set()
+            finally:
+                connection.close()
+
+        def same_supervisor(expected):
+            assert service.loaded_job_matches(gateway_service, payload["ProgramArguments"])
+            assert service.loaded_job_pid(gateway_service) == expected["pid"]
+            actual = service.process_snapshot(expected["pid"])
+            assert all(actual[key] == expected[key] for key in ("pid", "start", "pgid", "session", "cwd"))
+            assert actual["ppid"] == 1 and python_image in actual["texts"]
+
+        def unknown_after(previous=0):
+            state = store.read()
+            return (state.get("child") is None and state.get("phase") == "degraded"
+                    and state.get("diagnostic") == "Unknown process already owns gateway port"
+                    and state.get("diagnostic_at", 0) > previous and state)
+
+        def save_journal():
+            service.atomic_write(maintenance, json.dumps(journal).encode())
+
         try:
-            _run("/bin/launchctl", "bootstrap", domain, str(gateway_plist))
-            _wait(marker.exists, timeout=15, message="baseline maintenance injection")
-            _wait(lambda: store.read().get("child") is None and "Unknown process" in store.read().get("diagnostic", ""),
-                  timeout=15, message="baseline unknown-listener degraded state")
-            child = json.loads(maintenance.read_text())["child"]
-            child_snapshot = service.process_snapshot(child["pid"])
-            supervisor = service.loaded_job_pid(gateway_service)
-            assert supervisor is not None and child_snapshot["ppid"] == supervisor
-            keepalive = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
-            keepalive.auto_open = False
-            keepalive.connect()
-            keepalive.request("GET", "/api/health", headers={"Connection": "keep-alive"})
-            response = keepalive.getresponse()
-            assert response.status == 200 and json.loads(response.read())["ok"] is True
-            sock = keepalive.sock
-            endpoint = sock.getsockname()
-            assert maintenance.exists()
+            _run("/bin/launchctl", "bootstrap", domain, str(final_plist))
+            _run("/bin/launchctl", "bootstrap", domain, str(guard_plist))
+            _wait(marker.exists, timeout=45, message="baseline maintenance injection")
+            child = json.loads(marker.read_text())
+            state = _wait(unknown_after, message="baseline unknown-listener degraded state")
+            _wait(lambda: unknown_after(state["diagnostic_at"]), message="repeated baseline refusal")
+            supervisor = service.process_snapshot(service.loaded_job_pid(gateway_service))
+            assert json.loads(loaded.read_text()) == {"pid": supervisor["pid"], "sha256": hashlib.sha256(baseline_bytes).hexdigest()}
+            service.prove_child(child, require_listener=True)
+            assert service.process_snapshot(child["pid"])["ppid"] == supervisor["pid"]
+            _wait(lambda: (store.read().get("guard_status") or {}).get("ok"), message="live independent guard")
+            guard_pid = service.loaded_job_pid(jobs[0])
+            guard_start = service.process_snapshot(guard_pid)["start"]
+            state = store.read()
+            bindings = {key: state.get(key) for key in
+                        ("current", "qualified", "last_good", "config", "releases", "rollback_attempted", "install_transaction", "guard")}
+            journal = {"phase": "prepared", "child": child, "original_supervisor": supervisor,
+                       "bindings": bindings, "candidate_sha256": hashlib.sha256(patched_bytes).hexdigest(),
+                       "plists": {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                                  for path in (final_plist, guard_plist)},
+                       "arguments": payload["ProgramArguments"], "guard_pid": guard_pid, "guard_start": guard_start}
+            save_journal()
+            assert maintenance.stat().st_mode & 0o777 == 0o600
+            witness = threading.Thread(target=observe, name="maintenance-health")
+            witness.start()
+            assert witness_ready.wait(5), "No first health response"
+            if witness_errors:
+                raise witness_errors[0]
+            same_supervisor(supervisor)
             service.atomic_write(original_script, patched_bytes, original_script.stat().st_mode & 0o777)
-            _run("/bin/kill", "-KILL", str(supervisor))
-            _wait(lambda: service.loaded_job_pid(gateway_service) not in (None, supervisor), timeout=15,
-                  message="patched supervisor successor")
-            assert store.read().get("child") is None and service.listener_pids(port) == {child["pid"]}
-            helper = base / "interrupted-restore.py"
-            helper.write_text("import json,os,time;from pathlib import Path;"
-                              "p=Path(os.environ['STATE']);m=Path(os.environ['MAINTENANCE']);"
-                              "s=json.loads(p.read_text());s['generation']+=1;s['child']=json.loads(m.read_text())['child'];"
-                              "s['phase']='degraded';t=p.with_name('.restore.tmp');t.write_text(json.dumps(s));os.replace(t,p);time.sleep(60)", encoding="utf-8")
-            process = subprocess.Popen([str(python), str(helper)], env={**os.environ, "STATE": str(store.path), "MAINTENANCE": str(maintenance)}, start_new_session=True)
-            _wait(lambda: store.read().get("child") == child, timeout=5, message="interrupted ownership restore")
-            os.killpg(process.pid, signal.SIGKILL); process.wait(timeout=3)
-            _wait(lambda: store.read().get("phase") == "healthy" and store.read().get("child") == child, timeout=15,
-                  message="retained-child recovery")
-            assert keepalive.sock is sock and keepalive.sock.getsockname() == endpoint
-            keepalive.request("GET", "/api/health", headers={"Connection": "keep-alive"})
-            response = keepalive.getresponse()
-            assert response.status == 200 and json.loads(response.read())["ok"] is True
-            assert keepalive.sock is sock and keepalive.sock.getsockname() == endpoint
+            assert hashlib.sha256(original_script.read_bytes()).hexdigest() == journal["candidate_sha256"]
+            same_supervisor(supervisor)
+            service.prove_child(child, require_listener=True)
+            assert service.process_snapshot(child["pid"])["ppid"] == supervisor["pid"]
+            assert unknown_after()
+            journal.update(phase="script-installed", installation_barrier_at=time.time())
+            save_journal()
+            killed_at = time.monotonic()
+            os.kill(supervisor["pid"], signal.SIGKILL)  # Never signal the gateway/group.
+            successor_pid = _wait(lambda: (pid if (pid := service.loaded_job_pid(gateway_service))
+                                          not in (None, supervisor["pid"]) else None),
+                                  timeout=20, message="patched supervisor successor")
+            _wait(lambda: json.loads(loaded.read_text()) == {"pid": successor_pid, "sha256": journal["candidate_sha256"]},
+                  message="successor loaded patched bytes")
+            successor = service.process_snapshot(successor_pid)
+            same_supervisor(successor)
+            state = _wait(lambda: unknown_after(journal["installation_barrier_at"]), message="successor unknown-listener refusal")
+            _wait(lambda: unknown_after(state["diagnostic_at"]), message="repeated successor refusal")
+            service.prove_child(child, require_listener=True)
+            journal.update(phase="supervisor-replaced", successor=successor)
+            save_journal()
+            # Private resumable helper: kill before commit, then after atomic state
+            # commit but before its journal marker. Every run rereads under lock.
+            helper = base / "restore.py"
+            helper.write_text(
+                "import json,sys,time,hashlib,types\nfrom pathlib import Path\n"
+                f"source=Path({str(original_script)!r}); journal_path=Path({str(maintenance)!r})\n"
+                "m=types.ModuleType('repair');m.__file__=str(source);exec(compile(source.read_bytes(),str(source),'exec'),m.__dict__)\n"
+                f"store=m.StateStore(Path({str(store.path)!r})); name={gateway_service!r}; guard={jobs[0]!r}\n"
+                "j=json.loads(journal_path.read_text());assert j['installation_barrier_at']\n"
+                "assert hashlib.sha256(source.read_bytes()).hexdigest()==j['candidate_sha256']\n"
+                "def check(s):\n"
+                " assert s.get('transition') is None\n"
+                " assert all(s.get(k)==v for k,v in j['bindings'].items())\n"
+                " assert s.get('child') in (None,j['child'])\n"
+                " assert s['guard_status']['ok'] and time.time()-s['guard_status']['checked_at']<5\n"
+                " assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest()==h for p,h in j['plists'].items())\n"
+                " assert m.loaded_job_matches(name,j['arguments']) and m.loaded_job_pid(name)==j['successor']['pid']\n"
+                " actual=m.process_snapshot(j['successor']['pid'])\n"
+                " assert all(actual[k]==j['successor'][k] for k in ('pid','start','pgid','session','cwd'))\n"
+                f" assert {python_image!r} in actual['texts']\n"
+                " assert m.loaded_job_pid(guard)==j['guard_pid'] and m.process_snapshot(j['guard_pid'])['start']==j['guard_start']\n"
+                " m.prove_child(j['child'],require_listener=True)\n"
+                "def pause(phase):\n"
+                " if sys.argv[1]==phase:\n"
+                "  m.atomic_write(journal_path.with_name(phase+'.checkpoint'),phase.encode());time.sleep(60)\n"
+                "check(store.read());pause('before')\n"
+                "with store.locked() as s:\n"
+                " check(s)\n"
+                " if s.get('child') is None:\n"
+                "  assert s['phase']=='degraded';s['child']=j['child']\n"
+                "  m._diagnostic(s,'Proved existing child ownership restored; readiness pending')\n"
+                " else: assert s['phase'] in ('degraded','healthy')\n"
+                "pause('after')\n"
+                "j['phase']='ownership-restored';m.atomic_write(journal_path,json.dumps(j).encode())\n",
+                encoding="utf-8")
+            for phase in ("before", "after", "resume"):
+                process = subprocess.Popen([str(python), "-B", str(helper), phase],
+                                           env={**os.environ, "HOME": str(home)}, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.PIPE, start_new_session=True)
+                helpers.append(process)
+                if phase == "resume":
+                    _, errors = process.communicate(timeout=30)
+                    assert process.returncode == 0, errors.decode()
+                    break
+                checkpoint = base / f"{phase}.checkpoint"
+                def helper_paused():
+                    assert process.poll() is None, process.stderr.read().decode()
+                    return checkpoint.exists()
+                _wait(helper_paused, timeout=30, message=f"helper {phase}-commit barrier")
+                assert json.loads(maintenance.read_text())["phase"] == "supervisor-replaced"
+                assert store.read().get("child") == (None if phase == "before" else child)
+                os.kill(process.pid, signal.SIGKILL)
+                process.wait(timeout=3)
+                assert process.returncode == -signal.SIGKILL
+                if phase == "before":
+                    # A newer unrelated update must survive the resumed locked write.
+                    with store.locked() as state:
+                        state["maintenance_test_sentinel"] = "concurrent-update"
+                    _wait(lambda: unknown_after(), message="pre-commit interruption leaves refusal intact")
+            assert json.loads(maintenance.read_text())["phase"] == "ownership-restored"
+            _wait(lambda: store.read().get("phase") == "healthy" and store.read().get("child") == child,
+                  timeout=45, message="retained-child recovery")
+            assert json.loads(readiness.read_text()) == {"pid": successor_pid, "successes": 3, "result": True}
+            assert store.read()["diagnostic"] == "Recovered retained child: healthy"
+            assert store.read()["maintenance_test_sentinel"] == "concurrent-update"
+            assert all(store.read().get(key) == value for key, value in bindings.items())
+            same_supervisor(successor)
+            service.prove_child(child, require_listener=True)
+            assert service.listener_pids(port) == {child["pid"]}
+            assert service.loaded_job_pid(jobs[0]) == guard_pid
+            assert service.process_snapshot(guard_pid)["start"] == guard_start
+            assert store.read()["guard_status"]["ok"]
+            recovered_at = time.monotonic()
+            _wait(lambda: samples and samples[-1][0] > recovered_at, timeout=5, message="same socket after recovery")
+            assert any(sample[0] < killed_at for sample in samples)
+            print("PASS maintenance:", json.dumps({"gateway_pid": child["pid"], "start": child["start"],
+                  "pgid": child["pgid"], "supervisor_before": supervisor["pid"], "supervisor_after": successor_pid,
+                  "guard_pid": guard_pid, "socket": samples[0][1], "health_responses": len(samples),
+                  "helper_interruptions": ["before-commit", "after-commit-before-journal"], "ready_successes": 3}), flush=True)
+        except BaseException:
+            print("MAINTENANCE DEBUG", base, json.dumps(store.read()), file=sys.stderr)
+            for diagnostic in logs.glob("*"):
+                print(diagnostic.name, diagnostic.read_text(errors="replace")[-4000:], file=sys.stderr)
+            raise
         finally:
-            if keepalive is not None:
-                keepalive.close()
+            witness_stop.set()
+            if witness is not None:
+                witness.join(timeout=5)
+            for process in helpers:
+                if process.poll() is None:
+                    os.kill(process.pid, signal.SIGKILL)
+                    process.wait(timeout=3)
+                process.stderr.close()
             for job in jobs:
                 _bootout(job)
-            with contextlib.suppress(Exception):
-                record = store.read().get("child")
-                if record:
-                    service.stop_child(record, graceful=1)
+            # The missing-record failure path still owns the exact saved identity.
+            record = child or (json.loads(captured.read_text()) if captured.exists() else store.read().get("child"))
+            if record:
+                service.stop_child(record, graceful=1)
+                assert service._confirmed_record_gone(record)
             _wait(lambda: not service.listener_pids(port), timeout=5, message="maintenance listener cleanup")
+            assert all(not service._loaded(job) for job in jobs)
+            if witness is not None:
+                assert not witness.is_alive(), "Health witness did not stop"
+            if witness_errors:
+                raise witness_errors[0]
 
 
 def real_launchd_checks():
@@ -859,6 +1044,23 @@ def real_launchd_checks():
                   timeout=15, message="missing-job recovery")
             timings["missing_job"] = time.monotonic() - start
 
+            # Recorded-child supervisor replacement remains separate coverage;
+            # missing-record maintenance below must send only one supervisor kill.
+            _wait(lambda: store.read().get("phase") == "healthy", timeout=45, message="recorded child ready")
+            retained = store.read()["child"]
+            old_supervisor = service.loaded_job_pid(gateway_service)
+            service.prove_child(retained, require_listener=True)
+            assert old_supervisor is not None  # Child may already be orphaned by the preceding bootout.
+            start = time.monotonic()
+            os.kill(old_supervisor, signal.SIGKILL)
+            _wait(lambda: service.loaded_job_pid(gateway_service) not in (None, old_supervisor),
+                  timeout=20, message="recorded-child supervisor successor")
+            _wait(lambda: store.read().get("phase") == "healthy" and service.health(port),
+                  timeout=45, message="recorded-child restart health")
+            assert store.read()["child"] == retained
+            service.prove_child(retained, require_listener=True)
+            timings["recorded_child_supervisor_kill"] = time.monotonic() - start
+
             maintenance_rehearsal_checks(python, runtime_path)
 
             # A hung local health handler triggers bounded restart recovery.
@@ -871,8 +1073,17 @@ def real_launchd_checks():
                                         "rollback": locked["qualified"], "queued_at": time.time()}
                 locked["phase"] = "transition-queued"
             start = time.monotonic()
-            _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "healthy",
-                  timeout=35, message="hung-health rollback")
+            rollback_phases = []
+            def rolled_back():
+                current = store.read()
+                phase = (current["phase"], (current.get("child") or {}).get("pid"))
+                if not rollback_phases or rollback_phases[-1][1:] != phase:
+                    rollback_phases.append((round(time.monotonic() - start, 3), *phase))
+                return current.get("transition") is None and current.get("current") == "healthy"
+            try:
+                _wait(rolled_back, timeout=35, message="hung-health rollback")
+            finally:
+                print("Hung-health phases:", json.dumps(rollback_phases), flush=True)
             timings["hung_health_rollback"] = time.monotonic() - start
             assert service.health(port, .2)
 
