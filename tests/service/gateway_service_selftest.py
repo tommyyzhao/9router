@@ -1006,8 +1006,25 @@ def real_launchd_checks():
             "def monitor(store,config,record):\n"
             " global count\n"
             " count+=1;m.atomic_write(marker,json.dumps(dict(child=record,entry=count)).encode())\n"
+            " print(json.dumps(dict(at=time.time(),call='monitor',event='entry',child=record['pid'],entry=count)),flush=True)\n"
             " return original(store,config,record)\n"
-            "m.monitor=monitor;m.supervise(sd)\n", encoding="utf-8")
+            "m.monitor=monitor\n"
+            "def traced(name):\n"
+            " original=getattr(m,name)\n"
+            " def call(*args,**kwargs):\n"
+            "  started=time.monotonic();subject=(args[0] if name in ('_run_probe','listener_pids') else (args[0].get('pid') if args and isinstance(args[0],dict) else None))\n"
+            "  print(json.dumps(dict(at=time.time(),call=name,event='start',subject=subject)),flush=True)\n"
+            "  try:\n"
+            "   result=original(*args,**kwargs)\n"
+            "   detail=result if isinstance(result,(bool,int,type(None))) else None\n"
+            "   print(json.dumps(dict(at=time.time(),call=name,event='return',seconds=round(time.monotonic()-started,3),result=detail)),flush=True)\n"
+            "   return result\n"
+            "  except BaseException as error:\n"
+            "   print(json.dumps(dict(at=time.time(),call=name,event='error',seconds=round(time.monotonic()-started,3),error=str(error))),flush=True);raise\n"
+            " return call\n"
+            "for name in ('_run_probe','listener_pids','prove_child','wait_ready','monitor','rollback','stop_child','_record_failure'):\n"
+            " setattr(m,name,traced(name))\n"
+            "m.supervise(sd)\n", encoding="utf-8")
         supervisor_payload = plistlib.loads(gateway_plist.read_bytes())
         supervisor_payload["ProgramArguments"] = [str(python), "-B", str(supervisor_wrapper)]
         service.atomic_write(gateway_plist, plistlib.dumps(supervisor_payload))
@@ -1257,8 +1274,16 @@ def real_launchd_checks():
                                         "rollback": locked["qualified"], "queued_at": time.time()}
                 locked["phase"] = "transition-queued"
             start = time.monotonic()
-            _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "healthy",
-                  timeout=transition_deadline, message="post-ready crash rollback")
+            crash_previous = store.read().get("child")
+            _wait(lambda: (record := store.read().get("child")) and record != crash_previous
+                  and record.get("release") == str(healthy),
+                  timeout=prepare_observation + _READY_OBSERVATION + float(store.read()["config"]["probation"])
+                          + _IDENTITY_SECONDS + 2 + _PROBE_SECONDS + _IDENTITY_SECONDS
+                          + stop_observation + _PRESTART_SECONDS,
+                  message="post-ready crash rollback child recorded")
+            _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "healthy"
+                  and store.read().get("phase") == "healthy",
+                  timeout=_READY_OBSERVATION, message="post-ready crash rollback ready")
             timings["crash_rollback"] = time.monotonic() - start
             assert service.health(port, .2)
 
@@ -1278,22 +1303,48 @@ def real_launchd_checks():
                   timeout=transition_deadline, message="post-probation crashloop qualification")
             qualified_at = time.monotonic()
             assert store.read()["last_good"] == "healthy"
-            failure_budget = int(store.read()["config"]["failure_budget"])
+            config = store.read()["config"]
+            failure_budget = int(config["failure_budget"])
+            detection_observation = int(config["health_failures"]) * (float(config["health_interval"])
+                                                                     + _IDENTITY_SECONDS + 2)
+            failure_window = service._record_failure.__defaults__[0]
+            observed_failures = []
+            def crash_state():
+                current = store.read()
+                failures = current.get("failures", [])
+                if failures != observed_failures:
+                    print("Crash failures:", json.dumps({"at": time.time(), "phase": current["phase"],
+                          "child": (current.get("child") or {}).get("pid"), "times": failures}), flush=True)
+                    assert current.get("rollback_attempted") or all(stamp in failures for stamp in observed_failures), (
+                        "Crash budget timestamps expired before exhaustion", failure_window, observed_failures, failures)
+                    observed_failures[:] = failures
+                if observed_failures and len(observed_failures) < failure_budget and not current.get("rollback_attempted"):
+                    assert time.time() - observed_failures[0] < failure_window, (
+                        "Crash injection cannot exercise budget within failure window", failure_window, observed_failures)
+                return current
             for attempt in range(failure_budget):
                 failed_record = _wait(monitored_child, timeout=_READY_OBSERVATION,
                                       message=f"crashloop monitor entry {attempt + 1}")
                 assert failed_record["release"] == str(crashloop)
+                failures_before = list(crash_state().get("failures", []))
                 service.signal_child(failed_record, signal.SIGKILL, require_listener=True)
-                if attempt + 1 < failure_budget:
-                    _wait(lambda old_pid=failed_record["pid"]: store.read().get("current") == "crashloop"
-                          and store.read().get("phase") == "healthy"
-                          and (store.read().get("child") or {}).get("pid") != old_pid,
-                          timeout=transition_deadline, message=f"crashloop restart {attempt + 1}")
-                else:
-                    _wait(lambda: store.read().get("transition") is None
-                          and store.read().get("current") == "healthy"
-                          and store.read().get("phase") == "healthy",
-                          timeout=transition_deadline, message="crash-budget rollback")
+                _wait(lambda: len(crash_state().get("failures", [])) > len(failures_before),
+                      timeout=detection_observation, message=f"crash {attempt + 1} durably counted")
+                target = crashloop if attempt + 1 < failure_budget else healthy
+                def replacement_recorded():
+                    record = crash_state().get("child")
+                    return (record if record and record["pid"] != failed_record["pid"]
+                            and record["release"] == str(target) else None)
+                replacement = _wait(replacement_recorded,
+                                    timeout=stop_observation + float(config["max_backoff"])
+                                            + _PROBE_SECONDS + _IDENTITY_SECONDS + _PRESTART_SECONDS,
+                                    message=f"crash {attempt + 1} replacement recorded")
+                def replacement_ready():
+                    current = crash_state()
+                    return (current.get("transition") is None and current.get("phase") == "healthy"
+                            and current.get("current") == target.name and current.get("child") == replacement)
+                _wait(replacement_ready, timeout=_READY_OBSERVATION,
+                      message=f"crash {attempt + 1} replacement ready")
             timings["post_probation_crash_rollback"] = time.monotonic() - qualified_at
             assert store.read()["rollback_attempted"] == "healthy"
             assert service.health(port, .2)
@@ -1305,22 +1356,19 @@ def real_launchd_checks():
             assert baseline_record["release"] == str(healthy)
             degraded_interval = float(store.read()["config"]["degraded_interval"])
             service.signal_child(baseline_record, signal.SIGKILL, require_listener=True)
-            config = store.read()["config"]
-            detection_observation = int(config["health_failures"]) * (float(config["health_interval"])
-                                                                     + _IDENTITY_SECONDS + 2)
             _wait(lambda: store.read().get("phase") == "degraded" and store.read().get("child") is None,
                   timeout=detection_observation + stop_observation, interval=.02,
                   message="failing baseline degraded state")
             assert store.read()["diagnostic"] == "Qualified fallback crash-loop exhausted; slow restart"
             degraded_at = float(store.read()["diagnostic_at"])
             _wait(lambda: (store.read().get("child") or {}).get("pid") not in (None, baseline_record["pid"]),
-                  timeout=degraded_interval + startup_timeout, interval=.02,
+                  timeout=degraded_interval + _PRESTART_SECONDS, interval=.02,
                   message="slow degraded baseline retry")
             retry_recorded_at = time.time()
             timings["failing_baseline_slow_retry"] = retry_recorded_at - degraded_at
             assert timings["failing_baseline_slow_retry"] >= degraded_interval - .25
             _wait(lambda: store.read().get("phase") == "healthy" and service.health(port, .2),
-                  timeout=startup_timeout, message="baseline healthy after slow retry")
+                  timeout=_READY_OBSERVATION, message="baseline healthy after slow retry")
 
             # Loaded-but-unhealthy stable job is explicitly booted out before the
             # original fallback is loaded; future recovery persists that fallback.
