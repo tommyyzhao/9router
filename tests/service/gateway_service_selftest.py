@@ -717,7 +717,7 @@ def real_launchd_checks():
             service.atomic_write(original_script, baseline_bytes, original_script.stat().st_mode & 0o777)
             old_supervisor_pid = service.loaded_job_pid(gateway_service)
             assert old_supervisor_pid is not None
-            _run("/usr/bin/kill", "-KILL", str(old_supervisor_pid))
+            _run("/bin/kill", "-KILL", str(old_supervisor_pid))
             _wait(lambda: service.loaded_job_pid(gateway_service) not in (None, old_supervisor_pid)
                   and service.health(port, .2), timeout=15, message="old supervisor relaunch")
             assert original_script.read_bytes() == baseline_bytes
