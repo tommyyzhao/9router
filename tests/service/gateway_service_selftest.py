@@ -1137,8 +1137,14 @@ def real_launchd_checks():
                                         "rollback": locked["qualified"], "queued_at": time.time()}
                 locked["phase"] = "transition-queued"
             start = time.monotonic()
+            prebind_previous = store.read().get("child")
+            _wait(lambda: (record := store.read().get("child")) and record != prebind_previous
+                  and record.get("release") == str(healthy),
+                  timeout=prepare_observation + _READY_OBSERVATION + _PROBE_SECONDS
+                          + _IDENTITY_SECONDS + stop_observation + _PRESTART_SECONDS,
+                  message="prebind rollback child recorded")
             _wait(lambda: store.read().get("transition") is None and store.read().get("phase") == "healthy",
-                  timeout=20, message="prebind rollback")
+                  timeout=_READY_OBSERVATION, message="prebind rollback ready")
             timings["prebind_rollback"] = time.monotonic() - start
             assert store.read()["current"] == "healthy"
             assert service.health(port, .2)
@@ -1259,8 +1265,12 @@ def real_launchd_checks():
             assert baseline_record["release"] == str(healthy)
             degraded_interval = float(store.read()["config"]["degraded_interval"])
             service.signal_child(baseline_record, signal.SIGKILL, require_listener=True)
+            config = store.read()["config"]
+            detection_observation = int(config["health_failures"]) * (float(config["health_interval"])
+                                                                     + _IDENTITY_SECONDS + 2)
             _wait(lambda: store.read().get("phase") == "degraded" and store.read().get("child") is None,
-                  timeout=10, interval=.02, message="failing baseline degraded state")
+                  timeout=detection_observation + stop_observation, interval=.02,
+                  message="failing baseline degraded state")
             assert store.read()["diagnostic"] == "Qualified fallback crash-loop exhausted; slow restart"
             degraded_at = float(store.read()["diagnostic_at"])
             _wait(lambda: (store.read().get("child") or {}).get("pid") not in (None, baseline_record["pid"]),
