@@ -83,6 +83,17 @@ def install(args) -> None:
     bin_dir = args.bin_dir.resolve()
     releases_dir = args.releases_dir.resolve(strict=True)
     launch_agents = args.launch_agents.resolve()
+    label = _label(args.label)
+    guard_label = _label(args.guard_label)
+    stable_service = bin_dir / "gateway_service.py"
+    stable_release = bin_dir / "gateway_release.py"
+    staged_gateway_plist = service_dir / f"{label}.supervisor.plist"
+    guard_plist = launch_agents / f"{guard_label}.plist"
+    destinations = (service_dir / "state.json", stable_service, stable_release,
+                    staged_gateway_plist, guard_plist)
+    existing = [str(path) for path in destinations if path.exists()]
+    if existing:
+        raise ReleaseError("Install destination already exists; refusing overwrite: " + ", ".join(existing))
     for directory in (service_dir, bin_dir, launch_agents, args.log_dir.resolve()):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(service_dir, 0o700)
@@ -91,35 +102,28 @@ def install(args) -> None:
     node = args.node.resolve(strict=True)
     if not os.access(python, os.X_OK) or not os.access(node, os.X_OK):
         raise ReleaseError("Pinned Python and Node must be executable")
-    stable_service = bin_dir / "gateway_service.py"
-    stable_release = bin_dir / "gateway_release.py"
-    _copy_atomic(SOURCE, stable_service, 0o700)
-    _copy_atomic(Path(__file__), stable_release, 0o700)
     env_file = args.env_file.resolve(strict=True)
     schema_digest = args.schema_digest or service.fingerprint_schema(args.schema_source)
     baseline = service.validate_release(args.baseline, releases_dir, node, env_file, schema_digest)
-    label = _label(args.label)
-    guard_label = _label(args.guard_label)
     domain = f"gui/{os.getuid()}"
-    gateway_plist = launch_agents / f"{label}.plist"
-    guard_plist = launch_agents / f"{guard_label}.plist"
+    gateway_plist = staged_gateway_plist
     child_log = args.log_dir.resolve() / "gateway-child.log"
+    runtime_environment = {"HOME": str(args.home.resolve()), "PATH": args.runtime_path}
     gateway_content = _plist(
         label, [str(python), str(stable_service), "supervise", "--service-dir", str(service_dir)],
-        {"HOME": str(args.home.resolve()), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        runtime_environment,
         args.log_dir.resolve() / "supervisor.log", args.log_dir.resolve() / "supervisor.err",
     )
     guard_content = _plist(
         guard_label, [str(python), str(stable_service), "guard", "--service-dir", str(service_dir)],
-        {"HOME": str(args.home.resolve()), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        runtime_environment,
         args.log_dir.resolve() / "guard.log", args.log_dir.resolve() / "guard.err",
     )
-    service.atomic_write(gateway_plist, gateway_content, 0o600)
-    service.atomic_write(guard_plist, guard_content, 0o600)
     state = {
         "phase": "installed-unarmed",
         "current": args.baseline.name,
         "qualified": args.baseline.name,
+        "last_good": args.baseline.name,
         "releases": {args.baseline.name: baseline},
         "transition": None,
         "child": None,
@@ -138,6 +142,10 @@ def install(args) -> None:
     }
     store = service.StateStore(service_dir / "state.json")
     store.create(state)
+    _copy_atomic(SOURCE, stable_service, 0o700)
+    _copy_atomic(Path(__file__), stable_release, 0o700)
+    service.atomic_write(gateway_plist, gateway_content, 0o600)
+    service.atomic_write(guard_plist, guard_content, 0o600)
     print(json.dumps({"state": str(store.path), "gateway_plist": str(gateway_plist),
                       "guard_plist": str(guard_plist), "baseline": args.baseline.name}, indent=2))
 
@@ -150,6 +158,8 @@ def arm_install(args) -> None:
     stable = Path(state["guard"]["stable_plist"]).resolve(strict=True)
     fallback_source = args.original_plist.resolve(strict=True)
     fallback_copy = args.service_dir.resolve() / "original-gateway.plist"
+    if fallback_copy.exists():
+        raise ReleaseError("Original gateway backup already exists")
     _copy_atomic(fallback_source, fallback_copy, 0o600)
     with store.locked() as locked:
         locked["install_transaction"] = {
@@ -299,6 +309,8 @@ def parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--guard-label", default="io.9router.gateway.guard")
     install_parser.add_argument("--port", type=int, default=20128)
     install_parser.add_argument("--hostname", default="0.0.0.0")
+    install_parser.add_argument("--runtime-path", required=True,
+                                help="approved original gateway PATH; contents are never logged")
     install_parser.add_argument("--startup-timeout", type=float, default=45)
     install_parser.add_argument("--probation", type=float, default=120)
     install_parser.add_argument("--health-interval", type=float, default=5)

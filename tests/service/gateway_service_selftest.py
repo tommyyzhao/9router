@@ -127,6 +127,7 @@ def offline_checks():
         )
         store.create({
             "phase": "healthy", "current": release.name, "qualified": release.name,
+            "last_good": release.name,
             "releases": {release.name: release_record}, "transition": None,
             "child": {"pid": 42}, "config": {"releases_dir": str(base / "releases")},
         })
@@ -145,6 +146,47 @@ def offline_checks():
         args.release_name = "changed"
         with patch.object(release_tool.service, "validate_release", return_value=staged):
             expect_error("compatibility", release_tool.promote, args)
+
+    # Queued candidate mutation is rejected before the healthy child is touched.
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        healthy, node, env = make_live_release(base, "healthy")
+        candidate, _, _ = make_live_release(base, "candidate")
+        schema = service.fingerprint_schema(healthy)
+        current = service.validate_release(healthy, base / "releases", node, env, schema)
+        target = service.validate_release(candidate, base / "releases", node, env, schema)
+        store = service.StateStore(base / "state.json")
+        store.create({
+            "phase": "transition-queued", "current": "healthy", "qualified": "healthy",
+            "last_good": "healthy", "releases": {"healthy": current, "candidate": target},
+            "transition": {"phase": "queued", "target": "candidate", "rollback": "healthy"},
+            "child": {"sentinel": True}, "config": {"releases_dir": str(base / "releases"), "port": _free_port()},
+        })
+        (candidate / "server.js").write_text("changed after queue", encoding="utf-8")
+        with patch.object(service, "reconcile_record", side_effect=AssertionError("old child must remain untouched")):
+            expect_error("changed", service.apply_transition, store, store.read()["config"])
+        assert store.read()["child"] == {"sentinel": True}
+
+    # Install refuses existing state before writing scripts/plists.
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        release, node, env = make_release(base)
+        service_dir = base / "service"
+        service_dir.mkdir()
+        (service_dir / "state.json").write_text("existing", encoding="utf-8")
+        marker = base / "bin/gateway_service.py"
+        install_args = argparse.Namespace(
+            service_dir=service_dir, bin_dir=base / "bin", releases_dir=base / "releases",
+            launch_agents=base / "LaunchAgents", log_dir=base / "logs", baseline=release,
+            python=Path(sys.executable), node=node, env_file=env, schema_source=release,
+            schema_digest=None, label="test.gateway", guard_label="test.gateway.guard",
+            home=base, data_dir=base / "data", port=_free_port(), hostname="127.0.0.1",
+            runtime_path="/usr/bin:/bin", startup_timeout=1, probation=1,
+            health_interval=.1, health_failures=2, failure_budget=3, max_backoff=1,
+            degraded_interval=1, guard_interval=1, bootstrap_attempts=1,
+        )
+        expect_error("already exists", release_tool.install, install_args)
+        assert not marker.exists()
 
     # Use a real process whose title changes; identity never trusts argv/title.
     with tempfile.TemporaryDirectory() as raw:
@@ -270,6 +312,7 @@ def real_launchd_checks():
             "--releases-dir", str(releases_dir), "--launch-agents", str(launch_agents),
             "--log-dir", str(logs), "--home", str(home), "--data-dir", str(data),
             "--label", label, "--guard-label", guard_label, "--port", str(port),
+            "--runtime-path", os.environ.get("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
             "--hostname", "127.0.0.1", "--startup-timeout", "8", "--probation", "2",
             "--health-interval", ".25", "--health-failures", "2", "--failure-budget", "3",
             "--max-backoff", "1", "--degraded-interval", "2", "--guard-interval", ".5",
@@ -277,7 +320,7 @@ def real_launchd_checks():
         ]
         _run(str(python), *install_args)
         store = service.StateStore(service_dir / "state.json")
-        gateway_plist = launch_agents / f"{label}.plist"
+        gateway_plist = service_dir / f"{label}.supervisor.plist"
         guard_plist = launch_agents / f"{guard_label}.plist"
         fallback = base / "fallback.plist"
         fallback.write_bytes(gateway_plist.read_bytes())
@@ -307,20 +350,41 @@ def real_launchd_checks():
             state = store.read()
             old_child = state["child"]["pid"]
             supervisor_pid = int(_run("/bin/launchctl", "print", gateway_service).stdout.split("pid = ", 1)[1].splitlines()[0])
+            before_generation = state["generation"]
             killed = _run("/bin/launchctl", "kill", "SIGKILL", gateway_service, check=False)
             if killed.returncode:
                 raise AssertionError(f"scratch supervisor kill blocked: {killed.stderr}")
             start = time.monotonic()
-            _wait(lambda: _run("/bin/launchctl", "print", gateway_service, check=False).returncode == 0 and service.health(port, .2),
-                  timeout=15, message="supervisor relaunch")
+            def relaunched_supervisor():
+                result = _run("/bin/launchctl", "print", gateway_service, check=False)
+                if result.returncode or "pid = " not in result.stdout:
+                    return False
+                new_pid = int(result.stdout.split("pid = ", 1)[1].splitlines()[0])
+                return new_pid != supervisor_pid and store.read()["generation"] > before_generation and service.health(port, .2)
+            _wait(relaunched_supervisor, timeout=15, message="new supervisor relaunch and state activity")
             timings["supervisor_kill"] = time.monotonic() - start
             state = store.read()
             assert state["child"]["pid"] == old_child
             assert service.listener_pids(port) == {old_child}
 
+            # A hung local health handler triggers bounded restart recovery.
+            hung, _, _ = make_live_release(home / ".9router", "hang", "hang")
+            schema = state["releases"][state["qualified"]]["schema_digest"]
+            hung_record = service.validate_release(hung, releases_dir, node, env, schema)
+            with store.locked() as locked:
+                locked["releases"]["hang"] = hung_record
+                locked["transition"] = {"id": "hang", "phase": "queued", "target": "hang",
+                                        "rollback": locked["qualified"], "queued_at": time.time()}
+                locked["phase"] = "transition-queued"
+            start = time.monotonic()
+            _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "healthy",
+                  timeout=25, message="hung-health rollback")
+            timings["hung_health_rollback"] = time.monotonic() - start
+            assert service.health(port, .2)
+
             # Candidate prebind failure rolls back to the qualified release.
             broken, _, _ = make_live_release(home / ".9router", "prebind", "prebind")
-            schema = state["releases"][state["qualified"]]["schema_digest"]
+            schema = store.read()["releases"][store.read()["qualified"]]["schema_digest"]
             broken_record = service.validate_release(broken, releases_dir, node, env, schema)
             with store.locked() as locked:
                 locked["releases"]["prebind"] = broken_record
@@ -333,6 +397,37 @@ def real_launchd_checks():
             timings["prebind_rollback"] = time.monotonic() - start
             assert store.read()["current"] == "healthy"
             assert service.health(port, .2)
+
+            # A deployer may die immediately after atomically queuing intent;
+            # the launchd-owned supervisor still completes the transition.
+            promoted, _, _ = make_live_release(home / ".9router", "promoted", "healthy")
+            promoted_record = service.validate_release(promoted, releases_dir, node, env, schema)
+            with store.locked() as locked:
+                locked["releases"]["promoted"] = promoted_record
+            deployer = subprocess.Popen([
+                str(python), "-c",
+                "import fcntl,json,os,time;from pathlib import Path;p=Path(os.environ['STATE']);"
+                "f=open(str(p)+'.lock','r+');fcntl.flock(f,fcntl.LOCK_EX);s=json.loads(p.read_text());"
+                "s['generation']+=1;s['transition']={'id':'deployer','phase':'queued','target':'promoted','rollback':s['qualified'],'queued_at':time.time()};"
+                "t=p.with_name('.deployer.tmp');t.write_text(json.dumps(s));os.replace(t,p);fcntl.flock(f,fcntl.LOCK_UN);f.close();time.sleep(30)",
+            ], env={**os.environ, "STATE": str(store.path)}, start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _wait(lambda: (store.read().get("transition") or {}).get("id") == "deployer" or store.read().get("current") == "promoted",
+                  timeout=5, message="deployer intent")
+            os.killpg(deployer.pid, signal.SIGKILL)
+            deployer.wait(timeout=3)
+            start = time.monotonic()
+            _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "promoted",
+                  timeout=20, message="killed deployer promotion")
+            timings["deployer_kill"] = time.monotonic() - start
+            assert service.health(port, .2)
+            # Promote old healthy back so it remains the intended rollback baseline.
+            with store.locked() as locked:
+                locked["transition"] = {"id": "baseline", "phase": "queued", "target": "healthy",
+                                        "rollback": locked["qualified"], "queued_at": time.time()}
+                locked["phase"] = "transition-queued"
+            _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "healthy",
+                  timeout=20, message="restore baseline after deployer test")
 
             # Post-ready crash fails probation and rolls back.
             crash, _, _ = make_live_release(home / ".9router", "crash", "crash")

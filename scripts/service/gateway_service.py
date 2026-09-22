@@ -212,11 +212,20 @@ def validate_release(
     build_id = (release / ".next/BUILD_ID").read_text(encoding="utf-8").strip()
     if not build_id or "\n" in build_id:
         raise ServiceError("Invalid Next build ID")
+    node_digest = file_digest(node)
+    try:
+        node_version = subprocess.run([str(node), "--version"], stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                      timeout=5, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ServiceError(f"Cannot verify Node version: {error}") from error
     record = {
         "path": str(release),
         "digest": fingerprint_tree(release),
         "build_id": build_id,
         "node": str(node),
+        "node_digest": node_digest,
+        "node_version": node_version,
         "env_file": str(env_file),
         "env_digest": file_digest(env_file),
         "schema_digest": schema_digest,
@@ -375,16 +384,28 @@ def child_command(release: dict[str, Any]) -> list[str]:
 
 
 def spawn_child(release: dict[str, Any], port: int, hostname: str, data_dir: Path,
-                home: Path, log_path: Path) -> subprocess.Popen[bytes]:
+                home: Path, log_path: Path, start_gate: tuple[int, int] | None = None) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     environment.update({"HOSTNAME": hostname, "PORT": str(port), "HOME": str(home),
                         "DATA_DIR": str(data_dir)})
     log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     log = log_path.open("ab", buffering=0)
     try:
-        return subprocess.Popen(child_command(release), cwd=release["path"], env=environment,
+        if start_gate is None:
+            return subprocess.Popen(child_command(release), cwd=release["path"], env=environment,
+                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        read_fd, write_fd = start_gate
+        # Node itself waits before loading custom-server.js, so its exact identity
+        # is durable before any listener can bind. Pipe carries one non-secret byte.
+        gate = ("const fs=require('fs');const b=Buffer.alloc(1);"
+                f"if(fs.readSync({read_fd},b,0,1,null)!==1||b[0]!==49)process.exit(125);"
+                "require('module').runMain()")
+        command = [release["node"], f"--env-file={release['env_file']}", "-e", gate,
+                   str(Path(release["path"]) / "custom-server.js")]
+        return subprocess.Popen(command, cwd=release["path"], env=environment,
                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                start_new_session=True)
+                                start_new_session=True, pass_fds=(read_fd,))
     finally:
         log.close()
 
@@ -485,22 +506,25 @@ def start_selected(store: StateStore, release: dict[str, Any], config: dict[str,
     port = int(config["port"])
     if listener_pids(port):
         raise ServiceError("Unknown process owns gateway port before start")
+    read_fd, write_fd = os.pipe()
     process = spawn_child(release, port, config["hostname"], Path(config["data_dir"]),
-                          Path(config["home"]), Path(config["child_log"]))
+                          Path(config["home"]), Path(config["child_log"]), (read_fd, write_fd))
+    os.close(read_fd)
     try:
         record = capture_child_identity(process.pid, release, port)
+        with store.locked() as state:
+            if state.get("child") is not None:
+                raise ServiceError("Concurrent child appeared during start")
+            state["child"] = record
+            state["phase"] = phase
+        os.write(write_fd, b"1")
+        return record
     except BaseException:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(process.pid, signal.SIGKILL)
         raise
-    with store.locked() as state:
-        if state.get("child") is not None:
-            with contextlib.suppress(ServiceError):
-                signal_child(record, signal.SIGKILL, require_listener=False)
-            raise ServiceError("Concurrent child appeared during start")
-        state["child"] = record
-        state["phase"] = phase
-    return record
+    finally:
+        os.close(write_fd)
 
 
 def recover_interrupted(store: StateStore) -> None:
@@ -521,7 +545,7 @@ def recover_interrupted(store: StateStore) -> None:
 def rollback(store: StateStore, config: dict[str, Any], reason: str) -> dict[str, Any] | None:
     state = store.read()
     transition = state.get("transition") or {}
-    target_name = transition.get("rollback") or state.get("qualified")
+    target_name = transition.get("rollback") or state.get("last_good") or state.get("qualified")
     if not target_name:
         with store.locked() as locked:
             locked["phase"] = "degraded"
@@ -570,6 +594,11 @@ def apply_transition(store: StateStore, config: dict[str, Any]) -> dict[str, Any
     baseline = _runtime_release(state, rollback_name)
     if target["schema_digest"] != baseline["schema_digest"]:
         raise ServiceError("Database schema digest changed; automatic promotion blocked")
+    # Revalidate target and rollback before stopping the healthy child.
+    for release in (target, baseline):
+        validate_release(Path(release["path"]), Path(config["releases_dir"]),
+                         Path(release["node"]), Path(release["env_file"]),
+                         release["schema_digest"], release)
     record = reconcile_record(store, int(config["port"]))
     phase = transition.get("phase")
     if phase in {"queued", "stopping-current"}:
@@ -604,6 +633,7 @@ def apply_transition(store: StateStore, config: dict[str, Any]) -> dict[str, Any
             if not health(int(config["port"])):
                 return rollback(store, config, "Candidate liveness failed probation")
         with store.locked() as locked:
+            locked["last_good"] = locked["qualified"]
             locked["current"] = target_name
             locked["qualified"] = target_name
             locked["transition"] = None
@@ -670,7 +700,6 @@ def supervise(service_dir: Path) -> None:
                         continue
                     with store.locked() as locked:
                         locked["phase"] = "healthy"
-                        locked["failures"] = []
                         _diagnostic(locked, f"Healthy: {locked['current']}")
                 monitor(store, config, record)
             except ServiceError as error:
@@ -694,25 +723,50 @@ def _loaded(service: str) -> bool:
     return launchctl("print", service, timeout=5).returncode == 0
 
 
+def bootstrap_one(domain: str, service: str, plist: Path, name: str,
+                  attempts: int = 3) -> str:
+    errors: list[str] = []
+    if not plist.is_file() or plist.is_symlink():
+        raise ServiceError(f"{name} plist unavailable")
+    for attempt in range(attempts):
+        result = launchctl("bootstrap", domain, str(plist))
+        if result.returncode == 0 and _loaded(service):
+            return name
+        if _loaded(service):
+            raise ServiceError("A gateway job became loaded during bootstrap")
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")[:500]
+        errors.append(f"{name} bootstrap {attempt + 1} exit={result.returncode}: {detail}")
+        time.sleep(min(2 ** attempt, 4))
+    raise ServiceError("; ".join(errors))
+
+
 def bootstrap_with_fallback(domain: str, service: str, stable_plist: Path,
                             fallback_plist: Path | None, attempts: int = 3) -> str:
-    errors: list[str] = []
-    for plist, name in ((stable_plist, "stable"), (fallback_plist, "fallback")):
-        if plist is None:
-            continue
-        if not plist.is_file() or plist.is_symlink():
-            errors.append(f"{name} plist unavailable")
-            continue
-        for attempt in range(attempts):
-            result = launchctl("bootstrap", domain, str(plist))
-            if result.returncode == 0 and _loaded(service):
-                return name
-            if _loaded(service):
-                raise ServiceError("A different gateway job became loaded during bootstrap")
-            detail = (result.stderr or result.stdout).strip().replace("\n", " ")[:500]
-            errors.append(f"{name} bootstrap {attempt + 1} exit={result.returncode}: {detail}")
-            time.sleep(min(2 ** attempt, 4))
-    raise ServiceError("; ".join(errors))
+    try:
+        return bootstrap_one(domain, service, stable_plist, "stable", attempts)
+    except ServiceError as stable_error:
+        if fallback_plist is None or _loaded(service):
+            raise
+        try:
+            return bootstrap_one(domain, service, fallback_plist, "fallback", attempts)
+        except ServiceError as fallback_error:
+            raise ServiceError(f"{stable_error}; {fallback_error}") from fallback_error
+
+
+def prove_install_health(store: StateStore, expected: str, timeout: float) -> bool:
+    state = store.read()
+    record = state.get("child")
+    if expected == "stable":
+        if not isinstance(record, dict):
+            return False
+        release = _runtime_release(state, state["current"])
+        if record.get("release") != release["path"] or record.get("release_digest") != release["digest"]:
+            return False
+        try:
+            prove_child(record, require_listener=True)
+        except ServiceError:
+            return False
+    return health(int(state["config"]["port"]), min(timeout, 2))
 
 
 def guard(service_dir: Path) -> None:
@@ -736,7 +790,7 @@ def guard(service_dir: Path) -> None:
                         locked["install_transaction"]["phase"] = "bootstrapping-stable"
                         locked["phase"] = "installing"
                     phase = "bootstrapping-stable"
-                if phase in {"bootstrapping-stable", "fallback"}:
+                if phase == "bootstrapping-stable":
                     selected = bootstrap_with_fallback(
                         domain, service, Path(transaction["stable_plist"]),
                         Path(transaction["fallback_plist"]) if transaction.get("fallback_plist") else None,
@@ -747,20 +801,39 @@ def guard(service_dir: Path) -> None:
                         locked["install_transaction"]["phase"] = "loaded"
                         locked["phase"] = "installing"
                     phase = "loaded"
+                if phase == "fallback":
+                    if _loaded(service):
+                        result = launchctl("bootout", service)
+                        if result.returncode != 0 and _loaded(service):
+                            raise ServiceError(f"fallback bootout failed exit={result.returncode}")
+                    selected = bootstrap_one(domain, service, Path(transaction["fallback_plist"]),
+                                             "fallback", int(guard_config.get("bootstrap_attempts", 3)))
+                    with store.locked() as locked:
+                        locked["install_transaction"]["loaded"] = selected
+                        locked["install_transaction"]["phase"] = "loaded"
+                        locked["phase"] = "installing"
+                    phase = "loaded"
                 if phase == "loaded":
+                    selected = store.read()["install_transaction"].get("loaded")
                     deadline = time.monotonic() + float(guard_config.get("install_health_timeout", 45))
                     while time.monotonic() < deadline:
-                        if health(int(state["config"]["port"])):
+                        if prove_install_health(store, selected, 2):
                             break
                         if not _loaded(service):
                             raise ServiceError("gateway job disappeared during installation")
                         time.sleep(1)
                     else:
-                        raise ServiceError("installed gateway health deadline exceeded")
+                        if selected == "stable":
+                            with store.locked() as locked:
+                                locked["install_transaction"]["phase"] = "fallback"
+                                _diagnostic(locked, "Stable gateway unhealthy; restoring original job")
+                            continue
+                        raise ServiceError("fallback gateway health deadline exceeded")
                     with store.locked() as locked:
                         locked["install_transaction"]["phase"] = "committed"
+                        locked["guard"]["stable_plist"] = locked["install_transaction"]["stable_plist" if selected == "stable" else "fallback_plist"]
                         locked["phase"] = "healthy"
-                        _diagnostic(locked, "Installation transaction committed")
+                        _diagnostic(locked, f"Installation transaction committed on {selected}")
             elif not _loaded(service):
                 bootstrap_with_fallback(domain, service, Path(guard_config["stable_plist"]),
                                         None, int(guard_config.get("bootstrap_attempts", 3)))
