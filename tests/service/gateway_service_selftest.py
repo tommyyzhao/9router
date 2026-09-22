@@ -590,6 +590,24 @@ def real_launchd_checks():
             assert store.read()["current"] == "healthy"
             assert service.health(port, .2)
 
+            # Measure the exact identity/readiness cost used by the supervisor.
+            # Scratch initially uses an 8s fault-injection deadline; healthy
+            # promotions below use the production 45s startup deadline.
+            readiness_record = store.read()["child"]
+            probe_samples = []
+            for _ in range(3):
+                probe_start = time.monotonic()
+                service.prove_child(readiness_record, require_listener=True)
+                probe_samples.append(time.monotonic() - probe_start)
+            readiness_start = time.monotonic()
+            assert service.wait_ready(readiness_record, 45)
+            readiness_elapsed = time.monotonic() - readiness_start
+            timings["identity_probe_max"] = max(probe_samples)
+            timings["wait_ready_probe"] = readiness_elapsed
+            startup_timeout = 45.0
+            with store.locked() as locked:
+                locked["config"]["startup_timeout"] = startup_timeout
+
             # A deployer may die immediately after atomically queuing intent;
             # the launchd-owned supervisor still completes the transition.
             promoted, _, _ = make_live_release(home / ".9router", "promoted", "healthy")
@@ -609,8 +627,21 @@ def real_launchd_checks():
             os.killpg(deployer.pid, signal.SIGKILL)
             deployer.wait(timeout=3)
             start = time.monotonic()
+            _wait(lambda: ((store.read().get("child") or {}).get("release") == str(promoted)
+                           or store.read().get("current") == "promoted"),
+                  timeout=startup_timeout, message="promoted child identity persistence")
+            timings["deployer_child_recorded"] = time.monotonic() - start
+            promoted_child = store.read().get("child")
+            assert promoted_child and promoted_child["release"] == str(promoted)
+            _wait(lambda: service.listener_pids(port) == {promoted_child["pid"]},
+                  timeout=startup_timeout, message="promoted listener ownership")
+            probe_start = time.monotonic()
+            service.prove_child(promoted_child, require_listener=True)
+            timings["deployer_identity_probe"] = time.monotonic() - probe_start
+            transition_deadline = (startup_timeout + float(store.read()["config"]["probation"])
+                                   + 2 * timings["deployer_identity_probe"] + 5)
             _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "promoted",
-                  timeout=20, message="killed deployer promotion")
+                  timeout=transition_deadline, message="killed deployer promotion")
             timings["deployer_kill"] = time.monotonic() - start
             assert service.health(port, .2)
             # Promote old healthy back so it remains the intended rollback baseline.
@@ -619,7 +650,7 @@ def real_launchd_checks():
                                         "rollback": locked["qualified"], "queued_at": time.time()}
                 locked["phase"] = "transition-queued"
             _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "healthy",
-                  timeout=20, message="restore baseline after deployer test")
+                  timeout=transition_deadline, message="restore baseline after deployer test")
 
             # Post-ready crash fails probation and rolls back.
             crash, _, _ = make_live_release(home / ".9router", "crash", "crash")
@@ -631,9 +662,130 @@ def real_launchd_checks():
                 locked["phase"] = "transition-queued"
             start = time.monotonic()
             _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "healthy",
-                  timeout=20, message="post-ready crash rollback")
+                  timeout=transition_deadline, message="post-ready crash rollback")
             timings["crash_rollback"] = time.monotonic() - start
             assert service.health(port, .2)
+
+            # A candidate first passes readiness and probation. Repeated real child
+            # exits then exhaust the durable monitor budget and select last_good.
+            crashloop, _, _ = make_live_release(home / ".9router", "crashloop", "healthy")
+            crashloop_record = service.validate_release(crashloop, releases_dir, node, env, schema)
+            with store.locked() as locked:
+                locked["releases"]["crashloop"] = crashloop_record
+                locked["transition"] = {"id": "crashloop", "phase": "queued", "target": "crashloop",
+                                        "rollback": locked["qualified"], "queued_at": time.time()}
+                locked["phase"] = "transition-queued"
+            start = time.monotonic()
+            _wait(lambda: store.read().get("transition") is None
+                  and store.read().get("current") == "crashloop"
+                  and store.read().get("phase") == "healthy",
+                  timeout=transition_deadline, message="post-probation crashloop qualification")
+            qualified_at = time.monotonic()
+            assert store.read()["last_good"] == "healthy"
+            failure_budget = int(store.read()["config"]["failure_budget"])
+            for attempt in range(failure_budget):
+                failed_record = store.read()["child"]
+                assert failed_record["release"] == str(crashloop)
+                service.signal_child(failed_record, signal.SIGKILL, require_listener=True)
+                if attempt + 1 < failure_budget:
+                    _wait(lambda old_pid=failed_record["pid"]: store.read().get("current") == "crashloop"
+                          and store.read().get("phase") == "healthy"
+                          and (store.read().get("child") or {}).get("pid") != old_pid,
+                          timeout=transition_deadline, message=f"crashloop restart {attempt + 1}")
+                else:
+                    _wait(lambda: store.read().get("transition") is None
+                          and store.read().get("current") == "healthy"
+                          and store.read().get("phase") == "healthy",
+                          timeout=transition_deadline, message="crash-budget rollback")
+            timings["post_probation_crash_rollback"] = time.monotonic() - qualified_at
+            assert store.read()["rollback_attempted"] == "healthy"
+            assert service.health(port, .2)
+
+            # The fallback then fails while the budget remains exhausted. It must
+            # enter degraded state, leave no child, wait, then retry slowly.
+            baseline_record = store.read()["child"]
+            degraded_interval = float(store.read()["config"]["degraded_interval"])
+            service.signal_child(baseline_record, signal.SIGKILL, require_listener=True)
+            _wait(lambda: store.read().get("phase") == "degraded" and store.read().get("child") is None,
+                  timeout=10, interval=.02, message="failing baseline degraded state")
+            degraded_at = float(store.read()["diagnostic_at"])
+            _wait(lambda: (store.read().get("child") or {}).get("pid") not in (None, baseline_record["pid"]),
+                  timeout=degraded_interval + startup_timeout, interval=.02,
+                  message="slow degraded baseline retry")
+            retry_recorded_at = time.time()
+            timings["failing_baseline_slow_retry"] = retry_recorded_at - degraded_at
+            assert timings["failing_baseline_slow_retry"] >= degraded_interval - .25
+            _wait(lambda: store.read().get("phase") == "healthy" and service.health(port, .2),
+                  timeout=startup_timeout, message="baseline healthy after slow retry")
+
+            # Loaded-but-unhealthy stable job is explicitly booted out before the
+            # original fallback is loaded; future recovery persists that fallback.
+            _bootout(guard_service)
+            _bootout(gateway_service)
+            stale_record = store.read().get("child")
+            if stale_record:
+                with contextlib.suppress(service.ServiceError):
+                    service.stop_child(stale_record, graceful=1)
+                with store.locked() as locked:
+                    if locked.get("child") == stale_record:
+                        locked["child"] = None
+            _wait(lambda: not service.listener_pids(port), timeout=5,
+                  message="pre-unhealthy listener cleanup")
+            unhealthy_plist = service_dir / "unhealthy-stable.plist"
+            unhealthy_config = plistlib.loads(gateway_plist.read_bytes())
+            unhealthy_config["ProgramArguments"] = [str(node), "-e", "setInterval(()=>{},1000)"]
+            unhealthy_plist.write_bytes(plistlib.dumps(unhealthy_config))
+            with store.locked() as locked:
+                locked["install_transaction"] = {
+                    "phase": "bootstrapping-stable", "stable_plist": str(unhealthy_plist),
+                    "fallback_plist": str(fallback), "fallback_arguments": fallback_payload["ProgramArguments"],
+                    "original_digest": hashlib.sha256(fallback.read_bytes()).hexdigest(),
+                    "final_plist": str(final_gateway_plist), "armed_at": time.time(),
+                }
+                locked["guard"]["install_health_timeout"] = 2
+                locked["phase"] = "installing"
+            start = time.monotonic()
+            _run("/bin/launchctl", "bootstrap", domain, str(guard_plist))
+            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed"
+                  and service.health(port, .2),
+                  timeout=18, message="loaded unhealthy stable fallback")
+            state = store.read()
+            timings["loaded_unhealthy_fallback"] = time.monotonic() - start
+            assert state["install_transaction"]["loaded"] == "fallback", state
+            assert state["guard"]["stable_plist"] == str(final_gateway_plist)
+            assert final_gateway_plist.read_bytes() == fallback.read_bytes()
+            _bootout(gateway_service)
+            _wait(lambda: _run("/bin/launchctl", "print", gateway_service, check=False).returncode == 0
+                  and service.health(port, .2),
+                  timeout=10, message="persisted fallback missing-job recovery")
+
+            # Reproduce the rejected-bootstrap incident shape. The invalid stable
+            # plist is rejected before launch; guard persists fallback, then only
+            # the exact digest-bound original is loaded and committed.
+            bad_stable = service_dir / "bad-stable.plist"
+            bad_stable.write_text("not a plist", encoding="utf-8")
+            _bootout(gateway_service)
+            with store.locked() as locked:
+                locked["guard"]["stable_plist"] = str(bad_stable)
+                locked["install_transaction"] = {
+                    "phase": "bootstrapping-stable", "stable_plist": str(bad_stable),
+                    "fallback_plist": str(fallback), "fallback_arguments": fallback_payload["ProgramArguments"],
+                    "original_digest": hashlib.sha256(fallback.read_bytes()).hexdigest(),
+                    "final_plist": str(final_gateway_plist), "armed_at": time.time(),
+                }
+                locked["phase"] = "installing"
+            start = time.monotonic()
+            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "fallback",
+                  timeout=5, interval=.02, message="bootstrap rejection persisted fallback")
+            assert not service._loaded(gateway_service)
+            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed"
+                  and service.health(port, .2),
+                  timeout=20, message="bootstrap rejection fallback")
+            state = store.read()
+            timings["bootstrap_rejection_fallback"] = time.monotonic() - start
+            assert state["install_transaction"]["phase"] == "committed", state
+            assert state["install_transaction"]["loaded"] == "fallback", state
+            assert final_gateway_plist.read_bytes() == fallback.read_bytes()
 
         except BaseException:
             print("SCRATCH DEBUG", base, "port", port, file=sys.stderr)
