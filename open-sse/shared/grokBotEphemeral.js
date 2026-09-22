@@ -151,11 +151,47 @@ export async function sendEnvelopedUserMessage({
 /** Extract latest assistant send-message text from ListTranscript proto/json mix. */
 export function extractAssistantTextFromList(rawText) {
   if (!rawText) return null;
+  const raw = String(rawText);
+
+  // Prefer an embedded tool_calls JSON object (long write args often break content-regex).
+  const marker = '"tool_calls"';
+  let searchFrom = 0;
+  let lastToolJson = null;
+  while (true) {
+    const mi = raw.indexOf(marker, searchFrom);
+    if (mi < 0) break;
+    const start = raw.lastIndexOf("{", mi);
+    if (start >= 0) {
+      let depth = 0;
+      for (let j = start; j < raw.length; j++) {
+        const ch = raw[j];
+        if (ch === "{") depth++;
+        else if (ch === "}") {
+          depth--;
+          if (depth === 0) {
+            const slice = raw.slice(start, j + 1);
+            try {
+              const obj = JSON.parse(slice);
+              if (obj && Array.isArray(obj.tool_calls) && obj.tool_calls.length) {
+                lastToolJson = slice;
+              }
+            } catch {
+              /* keep scanning */
+            }
+            break;
+          }
+        }
+      }
+    }
+    searchFrom = mi + marker.length;
+  }
+  if (lastToolJson) return lastToolJson;
+
   // Prefer send-message kind
   const re = /"kind":"send-message"[\s\S]*?"content":"((?:\\.|[^"\\])*)"/g;
   let last = null;
   let m;
-  while ((m = re.exec(rawText))) last = m[1];
+  while ((m = re.exec(raw))) last = m[1];
   if (last != null) {
     try {
       return JSON.parse(`"${last}"`);
@@ -231,15 +267,27 @@ export async function runEphemeralCompletion({
     });
     log?.debug?.("GROK_BOT", `ephemeral send ${sent.messageId} hex=${sent.hex}`);
 
+    // Do not return on the first transcript hit — early "ack" messages arrive
+    // before tool_calls JSON for long write turns. Prefer latest text and wait
+    // until it stabilizes (or we parse tool_calls when tools were requested).
     let assistantText = null;
+    let stable = 0;
+    const wantTools = Array.isArray(tools) && tools.length > 0;
     for (let i = 0; i < maxPolls; i++) {
       if (signal?.aborted) throw new Error("aborted");
       if (i) await new Promise((r) => setTimeout(r, pollMs));
       const listed = await listTranscript({ accessToken, machineId, agentId, base, signal });
-      if (listed.assistantText) {
+      if (!listed.assistantText) continue;
+      if (listed.assistantText === assistantText) {
+        stable += 1;
+      } else {
         assistantText = listed.assistantText;
-        break;
+        stable = 0;
       }
+      const parsedEarly = parseAssistantCompletion(assistantText);
+      if (parsedEarly.kind === "tool_calls") break;
+      if (!wantTools && stable >= 1) break;
+      if (wantTools && stable >= 2) break;
     }
     if (assistantText == null) {
       const err = new Error("Ephemeral worker produced no assistant text before timeout");
