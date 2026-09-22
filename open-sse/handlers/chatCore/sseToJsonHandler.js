@@ -5,6 +5,7 @@ import { FORMATS } from "../../translator/formats.js";
 import { PROVIDERS } from "../../config/providers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+import { openAICompletionToClaudeMessage, responsesToOpenAICompletion } from "./responseConverters.js";
 
 // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
 const isResponsesProvider = (p) => PROVIDERS[p]?.format === FORMATS.OPENAI_RESPONSES;
@@ -189,6 +190,13 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
   if (!isSSE && isJson && isResponsesProvider(provider)) {
     try {
       const jsonResponse = await providerResponse.json();
+      if (jsonResponse.status === "failed" || jsonResponse.status === "incomplete" || jsonResponse.error) {
+        appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+        return createErrorResult(
+          HTTP_STATUS.BAD_GATEWAY,
+          jsonResponse.error?.message || `Upstream Responses stream ${jsonResponse.status || "failed"}`
+        );
+      }
       if (onRequestSuccess) await onRequestSuccess();
       const usage = jsonResponse.usage || {};
       appendLog({ tokens: usage, status: "200 OK" });
@@ -207,6 +215,11 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
       }, { endpoint: clientRawRequest?.endpoint || null })).catch(() => {});
       if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
         return { success: true, response: new Response(JSON.stringify(jsonResponse), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+      }
+      if (sourceFormat === FORMATS.CLAUDE) {
+        const chatResponse = responsesToOpenAICompletion(jsonResponse, model);
+        const claudeResponse = openAICompletionToClaudeMessage(chatResponse);
+        return { success: true, response: new Response(JSON.stringify(claudeResponse), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
       }
       const inTokens = usage.input_tokens || 0;
       const outTokens = usage.output_tokens || 0;
@@ -243,6 +256,13 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
   if (isCodexResponsesApi) {
     try {
       const jsonResponse = await convertResponsesStreamToJson(providerResponse.body);
+      if (jsonResponse.status === "failed" || jsonResponse.status === "incomplete" || jsonResponse.error) {
+        appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+        return createErrorResult(
+          HTTP_STATUS.BAD_GATEWAY,
+          jsonResponse.error?.message || "Upstream Responses stream failed"
+        );
+      }
       if (onRequestSuccess) await onRequestSuccess();
 
       const usage = jsonResponse.usage || {};
@@ -269,6 +289,11 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
       // Client is Responses API → return as-is
       if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
         return { success: true, response: new Response(JSON.stringify(jsonResponse), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
+      }
+      if (sourceFormat === FORMATS.CLAUDE) {
+        const chatResponse = responsesToOpenAICompletion(jsonResponse, model);
+        const claudeResponse = openAICompletionToClaudeMessage(chatResponse);
+        return { success: true, response: new Response(JSON.stringify(claudeResponse), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
       }
 
       // Build client-format response.
@@ -337,6 +362,7 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
     const parsed = parseSSEToOpenAIResponse(sseText, model);
     if (!parsed) return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
     if (parsed.error) {
+      appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
       return createErrorResult(
         HTTP_STATUS.BAD_GATEWAY,
         parsed.error.message || "Upstream SSE stream failed"
@@ -375,13 +401,18 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
     // Strip reasoning_content only when content is non-empty.
     // When content is empty (e.g. thinking models that used all tokens for reasoning),
     // reasoning_content is the only useful output and must be preserved.
-    // Previously this was unconditional, which broke Qwen3.5, Claude extended thinking, etc.
-    if (parsed?.choices) {
+    // Claude clients receive the shared Anthropic conversion below.
+    if (sourceFormat !== FORMATS.CLAUDE && parsed?.choices) {
       for (const choice of parsed.choices) {
         if (choice?.message?.reasoning_content && choice.message.content) {
           delete choice.message.reasoning_content;
         }
       }
+    }
+
+    if (sourceFormat === FORMATS.CLAUDE) {
+      const claudeResponse = openAICompletionToClaudeMessage(parsed);
+      return { success: true, response: new Response(JSON.stringify(claudeResponse), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
     }
 
     // A Responses-format client (e.g. Codex) forced this provider to stream,
