@@ -521,6 +521,15 @@ def _free_port():
     return port
 
 
+# Real-test observation ceilings, not production wall-clock guarantees. File I/O
+# and scheduling add overhead; wait_ready checks its deadline between iterations.
+_PROBE_SECONDS = 5
+_IDENTITY_SECONDS = 4 * _PROBE_SECONDS  # snapshot ps/lsof, group ps, listener lsof
+_PRESTART_SECONDS = 5 + 5 * _PROBE_SECONDS  # throttle, two listeners, Node version, snapshot
+_READY_SECONDS = 45
+_READY_OBSERVATION = _READY_SECONDS + 2 * _IDENTITY_SECONDS + 2 + 1  # final readiness iteration
+
+
 def _wait(predicate, timeout=15, interval=.1, message="condition"):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -655,7 +664,7 @@ def maintenance_rehearsal_checks(python: Path, runtime_path: str):
                         "--service-dir", str(service_dir), "--bin-dir", str(bin_dir), "--releases-dir", str(releases_dir),
                         "--launch-agents", str(launch_agents), "--log-dir", str(logs), "--home", str(home),
                         "--data-dir", str(data), "--label", label, "--guard-label", guard_label, "--port", str(port),
-                        "--runtime-path", runtime_path, "--hostname", "127.0.0.1", "--startup-timeout", "8",
+                        "--runtime-path", runtime_path, "--hostname", "127.0.0.1", "--startup-timeout", str(_READY_SECONDS),
                         "--probation", "2", "--health-interval", ".25", "--health-failures", "2",
                         "--failure-budget", "3", "--max-backoff", "1", "--degraded-interval", "2",
                         "--guard-interval", ".5", "--bootstrap-attempts", "2"]
@@ -684,8 +693,10 @@ def maintenance_rehearsal_checks(python: Path, runtime_path: str):
             f"m.atomic_write(Path({str(loaded)!r}),json.dumps(dict(pid=os.getpid(),sha256=hashlib.sha256(content).hexdigest())).encode())\n"
             "orig=m.monitor; ready=m.wait_ready; start=m.start_selected; prove=m.prove_child\n"
             "def prove_child(*args,**kwargs):\n"
+            " started=time.monotonic()\n"
             " try: return prove(*args,**kwargs)\n"
             " except m.ServiceError as e: print('prove failed',str(e),flush=True);raise\n"
+            " finally: print('prove seconds',round(time.monotonic()-started,3),flush=True)\n"
             "def start_selected(*args,**kwargs):\n"
             " record=start(*args,**kwargs)\n"
             f" m.atomic_write(Path({str(captured)!r}),json.dumps(record).encode())\n"
@@ -717,7 +728,6 @@ def maintenance_rehearsal_checks(python: Path, runtime_path: str):
             state["install_transaction"] = {"phase": "committed", "loaded": "stable",
                 "stable_plist": str(gateway_plist), "final_plist": str(final_plist)}
             state["guard"]["stable_plist"] = str(final_plist)
-            state["config"]["startup_timeout"] = 45
         jobs = [f"{domain}/{guard_label}", gateway_service]
         child = None
         helpers = []
@@ -768,8 +778,15 @@ def maintenance_rehearsal_checks(python: Path, runtime_path: str):
         try:
             _run("/bin/launchctl", "bootstrap", domain, str(final_plist))
             _run("/bin/launchctl", "bootstrap", domain, str(guard_plist))
-            _wait(marker.exists, timeout=45, message="baseline maintenance injection")
-            child = json.loads(marker.read_text())
+            started = time.monotonic()
+            _wait(captured.exists, timeout=_PRESTART_SECONDS, message="baseline durable child capture")
+            child = json.loads(captured.read_text())
+            print("Maintenance capture seconds:", round(time.monotonic() - started, 3), flush=True)
+            started = time.monotonic()
+            _wait(marker.exists, timeout=_READY_OBSERVATION + 2 * _PROBE_SECONDS,
+                  message="baseline readiness then parent-proved injection")
+            assert json.loads(marker.read_text()) == child
+            print("Maintenance readiness/injection seconds:", round(time.monotonic() - started, 3), flush=True)
             state = _wait(unknown_after, message="baseline unknown-listener degraded state")
             _wait(lambda: unknown_after(state["diagnostic_at"]), message="repeated baseline refusal")
             supervisor = service.process_snapshot(service.loaded_job_pid(gateway_service))
@@ -878,7 +895,8 @@ def maintenance_rehearsal_checks(python: Path, runtime_path: str):
                     _wait(lambda: unknown_after(), message="pre-commit interruption leaves refusal intact")
             assert json.loads(maintenance.read_text())["phase"] == "ownership-restored"
             _wait(lambda: store.read().get("phase") == "healthy" and store.read().get("child") == child,
-                  timeout=45, message="retained-child recovery")
+                  timeout=_READY_OBSERVATION + float(bindings["config"]["degraded_interval"]),
+                  message="retained-child recovery")
             assert json.loads(readiness.read_text()) == {"pid": successor_pid, "successes": 3, "result": True}
             assert store.read()["diagnostic"] == "Recovered retained child: healthy"
             assert store.read()["maintenance_test_sentinel"] == "concurrent-update"
@@ -966,7 +984,7 @@ def real_launchd_checks():
             "--log-dir", str(logs), "--home", str(home), "--data-dir", str(data),
             "--label", label, "--guard-label", guard_label, "--port", str(port),
             "--runtime-path", os.environ.get("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
-            "--hostname", "127.0.0.1", "--startup-timeout", "8", "--probation", "2",
+            "--hostname", "127.0.0.1", "--startup-timeout", str(_READY_SECONDS), "--probation", "2",
             "--health-interval", ".25", "--health-failures", "2", "--failure-budget", "3",
             "--max-backoff", "1", "--degraded-interval", "2", "--guard-interval", ".5",
             "--bootstrap-attempts", "2",
@@ -976,17 +994,36 @@ def real_launchd_checks():
         gateway_plist = service_dir / f"{label}.supervisor.plist"
         final_gateway_plist = launch_agents / f"{label}.plist"
         guard_plist = launch_agents / f"{guard_label}.plist"
+        # Healthy state can be committed by rollback inside the previous monitor.
+        # Observe entry for this exact child before injecting its next failure.
+        monitor_entry = base / "monitor-entry.json"
+        supervisor_wrapper = base / "supervisor-observer.py"
+        supervisor_wrapper.write_text(
+            "import importlib.util,json,time\nfrom pathlib import Path\n"
+            f"source=Path({str(bin_dir / 'gateway_service.py')!r}); marker=Path({str(monitor_entry)!r}); sd=Path({str(service_dir)!r})\n"
+            "spec=importlib.util.spec_from_file_location('observed_service',source);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n"
+            "original=m.monitor;count=0\n"
+            "def monitor(store,config,record):\n"
+            " global count\n"
+            " count+=1;m.atomic_write(marker,json.dumps(dict(child=record,entry=count)).encode())\n"
+            " return original(store,config,record)\n"
+            "m.monitor=monitor;m.supervise(sd)\n", encoding="utf-8")
+        supervisor_payload = plistlib.loads(gateway_plist.read_bytes())
+        supervisor_payload["ProgramArguments"] = [str(python), "-B", str(supervisor_wrapper)]
+        service.atomic_write(gateway_plist, plistlib.dumps(supervisor_payload))
         # Test-only guard wrapper pauses exactly after stable bootstrap and before
         # the loaded phase write; launchd restarts it after SIGKILL.
         guard_checkpoint = base / "guard-after-bootstrap.checkpoint"
         guard_wrapper = base / "guard-kill-wrapper.py"
         guard_wrapper.write_text(
-            "import importlib.util,time\nfrom pathlib import Path\n"
+            "import importlib.util,signal\nfrom pathlib import Path\n"
             f"source=Path({str(bin_dir / 'gateway_service.py')!r}); checkpoint=Path({str(guard_checkpoint)!r}); service_dir=Path({str(service_dir)!r})\n"
             "spec=importlib.util.spec_from_file_location('gateway_service_guard_kill',source);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n"
             "original=m.bootstrap_with_fallback\n"
             "def stop(*args,**kwargs):\n result=original(*args,**kwargs)\n"
-            " if not checkpoint.exists(): checkpoint.write_text(result); time.sleep(60)\n"
+            " if not checkpoint.exists():\n"
+            "  checkpoint.write_text(result)\n"
+            "  signal.pause()  # Only the test SIGKILL/cleanup may release this boundary.\n"
             " return result\n"
             "m.bootstrap_with_fallback=stop\nm.guard(service_dir)\n",
             encoding="utf-8",
@@ -1011,6 +1048,12 @@ def real_launchd_checks():
         _run(str(python), str(RELEASE_SOURCE), "arm-install", "--service-dir", str(service_dir),
              "--original-plist", str(fallback))
         jobs = [guard_service, gateway_service]
+        def monitored_child():
+            state = store.read()
+            if state.get("phase") != "healthy" or not state.get("child") or not monitor_entry.exists():
+                return None
+            entry = json.loads(monitor_entry.read_text())
+            return state["child"] if entry["child"] == state["child"] and entry["entry"] > 0 else None
         try:
             # Real old direct job exists before the independent guard migrates it.
             _run("/bin/launchctl", "bootstrap", domain, str(fallback))
@@ -1020,14 +1063,30 @@ def real_launchd_checks():
             start = time.monotonic()
             _run("/bin/launchctl", "bootstrap", domain, str(guard_plist))
             _wait(guard_checkpoint.exists, timeout=15, message="guard post-bootstrap checkpoint")
-            _wait(lambda: service.loaded_job_pid(gateway_service) is not None and service.health(port, .2),
-                  timeout=12, message="stable supervisor healthy before guard kill")
+            expected_arguments = plistlib.loads(gateway_plist.read_bytes())["ProgramArguments"]
+            capture_started = time.monotonic()
+            stable_child = _wait(lambda: store.read().get("child"),
+                                 timeout=float(plistlib.loads(gateway_plist.read_bytes())["ThrottleInterval"]) + _PRESTART_SECONDS - 5,
+                                 message="stable supervisor durable child capture")
+            timings["stable_child_capture"] = time.monotonic() - capture_started
+            assert stable_child["release"] == str(healthy)
+            assert stable_child["release_digest"] == store.read()["releases"]["healthy"]["digest"]
+            assert service.loaded_job_matches(gateway_service, expected_arguments)
+            _wait(lambda: store.read().get("phase") == "healthy" and store.read().get("child") == stable_child,
+                  timeout=_READY_OBSERVATION, message="stable supervisor completed readiness before guard kill")
+            service.prove_child(stable_child, require_listener=True)
+            assert service.health(port)
             stable_pid_before_guard_kill = service.loaded_job_pid(gateway_service)
+            assert stable_pid_before_guard_kill is not None
+            timings["stable_child_ready"] = time.monotonic() - capture_started
+            print("Stable startup seconds:", json.dumps({key: round(timings[key], 3)
+                  for key in ("stable_child_capture", "stable_child_ready")}), flush=True)
             assert store.read()["install_transaction"]["phase"] == "bootstrapping-stable"
             killed = _run("/bin/launchctl", "kill", "SIGKILL", guard_service, check=False)
             assert killed.returncode == 0, killed.stderr
             _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed" and service.health(port, .2),
-                  timeout=20, message="guard-kill adoption migration")
+                  timeout=5 + _READY_SECONDS + _PROBE_SECONDS + _IDENTITY_SECONDS + 2 + 1,
+                  message="guard-kill adoption migration")
             assert service.loaded_job_pid(gateway_service) == stable_pid_before_guard_kill
             timings["initial_migration"] = time.monotonic() - start
             state = store.read()
@@ -1080,8 +1139,29 @@ def real_launchd_checks():
                 if not rollback_phases or rollback_phases[-1][1:] != phase:
                     rollback_phases.append((round(time.monotonic() - start, 3), *phase))
                 return current.get("transition") is None and current.get("current") == "healthy"
+            # Keep production readiness for both hung target and healthy rollback.
+            # Observe each stage separately: queued work includes the monitor's
+            # in-flight proof, two release validations, reconciliation and stop.
+            # Each stop allows TERM/KILL windows plus identity/absence proofs.
+            stop_observation = 10 + 5 + 2 * _IDENTITY_SECONDS + 4 * _PROBE_SECONDS
+            prepare_observation = (.25 + _IDENTITY_SECONDS + 2 + 2 * _PROBE_SECONDS
+                                   + _PROBE_SECONDS + _IDENTITY_SECONDS + stop_observation
+                                   + _PRESTART_SECONDS)
             try:
-                _wait(rolled_back, timeout=35, message="hung-health rollback")
+                def candidate_recorded():
+                    rolled_back()
+                    record = store.read().get("child")
+                    return record and record.get("release") == str(hung)
+                _wait(candidate_recorded, timeout=prepare_observation, message="hung candidate recorded")
+                def rollback_recorded():
+                    rolled_back()
+                    record = store.read().get("child")
+                    return record and record.get("release") == str(healthy)
+                _wait(rollback_recorded,
+                      timeout=_READY_OBSERVATION + _PROBE_SECONDS + _IDENTITY_SECONDS
+                              + stop_observation + _PRESTART_SECONDS,
+                      message="healthy rollback child recorded after hung readiness")
+                _wait(rolled_back, timeout=_READY_OBSERVATION, message="hung-health rollback ready")
             finally:
                 print("Hung-health phases:", json.dumps(rollback_phases), flush=True)
             timings["hung_health_rollback"] = time.monotonic() - start
@@ -1097,15 +1177,20 @@ def real_launchd_checks():
                                         "rollback": locked["qualified"], "queued_at": time.time()}
                 locked["phase"] = "transition-queued"
             start = time.monotonic()
+            prebind_previous = store.read().get("child")
+            _wait(lambda: (record := store.read().get("child")) and record != prebind_previous
+                  and record.get("release") == str(healthy),
+                  timeout=prepare_observation + _READY_OBSERVATION + _PROBE_SECONDS
+                          + _IDENTITY_SECONDS + stop_observation + _PRESTART_SECONDS,
+                  message="prebind rollback child recorded")
             _wait(lambda: store.read().get("transition") is None and store.read().get("phase") == "healthy",
-                  timeout=20, message="prebind rollback")
+                  timeout=_READY_OBSERVATION, message="prebind rollback ready")
             timings["prebind_rollback"] = time.monotonic() - start
             assert store.read()["current"] == "healthy"
             assert service.health(port, .2)
 
             # Measure the exact identity/readiness cost used by the supervisor.
-            # Scratch initially uses an 8s fault-injection deadline; healthy
-            # promotions below use the production 45s startup deadline.
+            # All scratch releases use the production 45s startup deadline.
             readiness_record = store.read()["child"]
             probe_samples = []
             for _ in range(3):
@@ -1117,9 +1202,7 @@ def real_launchd_checks():
             readiness_elapsed = time.monotonic() - readiness_start
             timings["identity_probe_max"] = max(probe_samples)
             timings["wait_ready_probe"] = readiness_elapsed
-            startup_timeout = 45.0
-            with store.locked() as locked:
-                locked["config"]["startup_timeout"] = startup_timeout
+            startup_timeout = float(store.read()["config"]["startup_timeout"])
 
             # A deployer may die immediately after atomically queuing intent;
             # the launchd-owned supervisor still completes the transition.
@@ -1197,7 +1280,8 @@ def real_launchd_checks():
             assert store.read()["last_good"] == "healthy"
             failure_budget = int(store.read()["config"]["failure_budget"])
             for attempt in range(failure_budget):
-                failed_record = store.read()["child"]
+                failed_record = _wait(monitored_child, timeout=_READY_OBSERVATION,
+                                      message=f"crashloop monitor entry {attempt + 1}")
                 assert failed_record["release"] == str(crashloop)
                 service.signal_child(failed_record, signal.SIGKILL, require_listener=True)
                 if attempt + 1 < failure_budget:
@@ -1216,11 +1300,18 @@ def real_launchd_checks():
 
             # The fallback then fails while the budget remains exhausted. It must
             # enter degraded state, leave no child, wait, then retry slowly.
-            baseline_record = store.read()["child"]
+            baseline_record = _wait(monitored_child, timeout=_READY_OBSERVATION,
+                                    message="rollback baseline monitor entry before failure")
+            assert baseline_record["release"] == str(healthy)
             degraded_interval = float(store.read()["config"]["degraded_interval"])
             service.signal_child(baseline_record, signal.SIGKILL, require_listener=True)
+            config = store.read()["config"]
+            detection_observation = int(config["health_failures"]) * (float(config["health_interval"])
+                                                                     + _IDENTITY_SECONDS + 2)
             _wait(lambda: store.read().get("phase") == "degraded" and store.read().get("child") is None,
-                  timeout=10, interval=.02, message="failing baseline degraded state")
+                  timeout=detection_observation + stop_observation, interval=.02,
+                  message="failing baseline degraded state")
+            assert store.read()["diagnostic"] == "Qualified fallback crash-loop exhausted; slow restart"
             degraded_at = float(store.read()["diagnostic_at"])
             _wait(lambda: (store.read().get("child") or {}).get("pid") not in (None, baseline_record["pid"]),
                   timeout=degraded_interval + startup_timeout, interval=.02,
