@@ -9,6 +9,7 @@ import {
 import { APIKEY_PROVIDERS } from "@/shared/constants/config";
 import { AI_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, isCustomEmbeddingProvider } from "@/shared/constants/providers";
 import { normalizeProviderId, normalizeProviderSpecificData } from "@/lib/providerNormalization";
+import { redactMuseDesktopSecrets } from "@/lib/providerResponse";
 
 export const dynamic = "force-dynamic";
 
@@ -66,14 +67,14 @@ export async function GET() {
       const name = isCompatible
         ? (c.name || nodeNameMap[c.provider] || c.providerSpecificData?.nodeName || c.provider)
         : c.name;
-      return {
+      return redactMuseDesktopSecrets({
         ...c,
         name,
         apiKey: undefined,
         accessToken: undefined,
         refreshToken: undefined,
         idToken: undefined,
-      };
+      });
     });
 
     return NextResponse.json({ connections: safeConnections });
@@ -186,7 +187,7 @@ export async function POST(request) {
     });
 
     // Hide sensitive fields
-    const result = { ...newConnection };
+    const result = redactMuseDesktopSecrets({ ...newConnection });
     delete result.apiKey;
 
     return NextResponse.json({ connection: result }, { status: 201 });
