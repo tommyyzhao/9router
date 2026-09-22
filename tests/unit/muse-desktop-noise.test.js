@@ -56,6 +56,7 @@ function makeResponder() {
   const init = new NoiseXXInitiator();
   const ss = init.ss;
   const eph = x25519Gen();
+  const stat = x25519Gen();
   return {
     readMessage1(msg) {
       const re = msg.subarray(0, 32);
@@ -65,12 +66,30 @@ function makeResponder() {
     },
     writeMessage2(payload) {
       ss.mixHash(eph.pub);
-      const [ck, tk] = hkdfCk(ss.ck, x25519Dh(eph.priv, this.re));
+      let [ck, tk] = hkdfCk(ss.ck, x25519Dh(eph.priv, this.re)); // ee
       ss.ck = ck;
       ss.cs.initializeKey(tk);
-      const ct = ss.encryptAndHash(payload);
-      const [k1, k2] = hkdfCk(ck, Buffer.alloc(0));
-      return { bytes: Buffer.concat([eph.pub, ct]), sendK: k2, recvK: k1, ss };
+      const encryptedStatic = ss.encryptAndHash(stat.pub);
+      [ck, tk] = hkdfCk(ss.ck, x25519Dh(stat.priv, this.re)); // es
+      ss.ck = ck;
+      ss.cs.initializeKey(tk);
+      const encryptedPayload = ss.encryptAndHash(payload);
+      return {
+        bytes: Buffer.concat([eph.pub, encryptedStatic, encryptedPayload]),
+        sendK: null,
+        recvK: null,
+        ss,
+        readMessage3: (msg) => {
+          const initiatorStatic = ss.decryptAndHash(msg.subarray(0, 48));
+          if (initiatorStatic.length !== 32) throw new Error("invalid initiator static key");
+          [ck, tk] = hkdfCk(ss.ck, x25519Dh(eph.priv, initiatorStatic)); // se
+          ss.ck = ck;
+          ss.cs.initializeKey(tk);
+          const gotPayload = ss.decryptAndHash(msg.subarray(48));
+          const [k1, k2] = hkdfCk(ss.ck, Buffer.alloc(0));
+          return { payload: gotPayload, sendK: k2, recvK: k1 };
+        },
+      };
     },
   };
 }
@@ -94,17 +113,15 @@ describe("muse Noise XX handshake (loopback)", () => {
     rsp.readMessage1(m1);
     const payload = crypto.randomBytes(70);
     const m2 = rsp.writeMessage2(payload);
-    expect(m2.bytes.length).toBe(32 + 70 + 16);
+    expect(m2.bytes.length).toBe(166); // 32B e + 48B Encrypt(s) + 86B Encrypt(payload)
     const { payload: got, handshakeHash } = init.readMessage2(m2.bytes);
     expect(got).toEqual(payload);
     const m3 = init.writeMessage3(Buffer.alloc(0));
-    // responder decrypts msg3
-    const pt = m2.ss.decryptAndHash(m3.bytes);
-    expect(pt.length).toBe(0);
-    // transport keys agree cross-wise (initiator send == responder recv)
-    const [rk1, rk2] = hkdfCk(m2.ss.ck, Buffer.alloc(0));
-    expect(m3.sendCipher.k).toEqual(rk1);
-    expect(m3.recvCipher.k).toEqual(rk2);
+    expect(m3.bytes.length).toBe(64); // 48B Encrypt(s) + 16B Encrypt(empty payload)
+    const responder = m2.readMessage3(m3.bytes);
+    expect(responder.payload).toEqual(Buffer.alloc(0));
+    expect(m3.sendCipher.k).toEqual(responder.recvK);
+    expect(m3.recvCipher.k).toEqual(responder.sendK);
     expect(handshakeHash.length).toBe(32);
   });
 });

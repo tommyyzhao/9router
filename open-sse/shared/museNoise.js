@@ -178,7 +178,7 @@ export class NoiseXXInitiator {
   constructor() {
     this.ss = new SymmetricState();
     this.e = x25519KeyPair();
-    this.s = null; // ephemeral-only initiator (XX without static)
+    this.s = x25519KeyPair();
     this.re = null;
     this.rs = null;
     this.clientNonce = crypto.randomBytes(32);
@@ -192,27 +192,30 @@ export class NoiseXXInitiator {
     this.ss.mixHash(nonceMsg);
     return Buffer.concat([this.e.pub, nonceMsg]);
   }
-  // <- msg2; returns {payload, handshakeHash, remoteStatic}
+  // <- msg2: e || Encrypt(s) || Encrypt(payload), with ee/es DH tokens.
+  // Returns {payload, handshakeHash, remoteStatic} after the full message.
   readMessage2(msg) {
     if (msg.length > MAX_HANDSHAKE_MSG) throw new Error("handshake message too large");
+    if (msg.length < 32 + 48 + 16) throw new Error("handshake message too short");
     const re = msg.subarray(0, 32);
-    let rest = msg.subarray(32);
     this.ss.mixHash(re);
-    this.ss.mixKey(x25519(this.e.priv, re));
+    this.ss.mixKey(x25519(this.e.priv, re)); // ee
     this.re = re;
-    rest = this.ss.decryptAndHash(rest);
-    // XX with empty static keys: no `s` section; payload is the remainder.
-    // The responder's static key here is its (empty) static section — with no
-    // static keys configured, msg2 = e || Encrypt(ee, payload).
-    const payload = rest;
+    this.rs = this.ss.decryptAndHash(msg.subarray(32, 32 + 48));
+    if (this.rs.length !== 32) throw new Error("invalid responder static key");
+    this.ss.mixKey(x25519(this.e.priv, this.rs)); // es
+    const payload = this.ss.decryptAndHash(msg.subarray(32 + 48));
     const handshakeHash = this.ss.handshakeHash();
-    return { payload, handshakeHash, remoteEph: re };
+    return { payload, handshakeHash, remoteEph: re, remoteStatic: this.rs };
   }
-  // -> msg3 (AEAD of the private-auth payload)
+  // -> msg3: Encrypt(s) || Encrypt(payload), with se DH token.
   writeMessage3(payloadBytes) {
-    const ct = this.ss.encryptAndHash(payloadBytes);
+    if (!this.rs) throw new Error("responder static key unavailable");
+    const encryptedStatic = this.ss.encryptAndHash(this.s.pub);
+    this.ss.mixKey(x25519(this.s.priv, this.re)); // se
+    const encryptedPayload = this.ss.encryptAndHash(payloadBytes);
     const [k1, k2] = this.ss.split();
-    return { bytes: ct, sendCipher: k1, recvCipher: k2 };
+    return { bytes: Buffer.concat([encryptedStatic, encryptedPayload]), sendCipher: k1, recvCipher: k2 };
   }
 }
 
