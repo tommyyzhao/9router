@@ -756,6 +756,11 @@ def monitor(store: StateStore, config: dict[str, Any], record: dict[str, Any]) -
             alive = health(int(config["port"]))
         except ServiceError:
             alive = False
+        if alive:
+            latest = store.read()
+            if (latest.get("phase") == "degraded" and latest.get("child") == record
+                    and latest.get("transition") is None):
+                return
         failures = 0 if alive else failures + 1
         if failures < int(config["health_failures"]):
             continue

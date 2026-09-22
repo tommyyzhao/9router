@@ -320,6 +320,46 @@ def offline_checks():
             expect_error("changed during recovery", service.recover_retained_child, store, config, record)
         assert store.read()["phase"] == "restarting"
 
+    # A transient retained-readiness miss must return through monitor, then retry
+    # full recovery without replacing the unchanged healthy child.
+    class RetainedSupervise(BaseException):
+        pass
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        release, node, env = make_release(base, "healthy")
+        release_record = service.validate_release(release, base / "releases", node, env,
+                                                  service.fingerprint_schema(release))
+        store = service.StateStore(base / "state.json")
+        record = {"pid": 42, "release": release_record["path"],
+                  "release_digest": release_record["digest"]}
+        config = {"port": _free_port(), "startup_timeout": 1, "health_interval": 0,
+                  "health_failures": 1, "failure_budget": 3, "degraded_interval": 0,
+                  "max_backoff": 0}
+        store.create({"phase": "degraded", "current": "healthy", "transition": None,
+                      "child": record, "releases": {"healthy": release_record}, "config": config})
+        readiness = iter((False, True))
+        sleeps = 0
+        def stop_after_recovery(_seconds):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 2:
+                raise RetainedSupervise()
+        with patch.object(service, "recover_interrupted"), \
+             patch.object(service, "apply_transition", return_value=record), \
+             patch.object(service, "wait_ready", side_effect=lambda *_: next(readiness)), \
+             patch.object(service, "prove_child"), \
+             patch.object(service, "health", return_value=True), \
+             patch.object(service.time, "sleep", side_effect=stop_after_recovery):
+            try:
+                service.supervise(base)
+            except RetainedSupervise:
+                pass
+            else:
+                raise AssertionError("supervise did not reach post-recovery monitor")
+        assert store.read()["phase"] == "healthy"
+        assert store.read()["child"] == record
+        assert sleeps == 2
+
     # Stop failure retains durable child ownership in restart and budget paths.
     stop_failure = service.ServiceError("stop denied")
     for exhausted in (False, True):
