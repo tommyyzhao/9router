@@ -520,8 +520,9 @@ def real_launchd_checks():
             with store.locked() as locked:
                 locked["install_transaction"] = {
                     "phase": "loaded", "loaded": "stable", "stable_plist": str(gateway_plist),
-                    "fallback_plist": str(fallback), "final_plist": str(final_gateway_plist),
-                    "armed_at": time.time(),
+                    "fallback_plist": str(fallback), "fallback_arguments": fallback_payload["ProgramArguments"],
+                    "original_digest": hashlib.sha256(fallback.read_bytes()).hexdigest(),
+                    "final_plist": str(final_gateway_plist), "armed_at": time.time(),
                 }
                 locked["phase"] = "installing"
             _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed",

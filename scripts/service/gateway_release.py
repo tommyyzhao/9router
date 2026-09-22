@@ -206,40 +206,33 @@ def validate_candidate_runtime(release: dict, scratch_root: Path, timeout: float
     scratch_data = scratch_root / "data"
     scratch_home.mkdir(parents=True, mode=0o700)
     scratch_data.mkdir(parents=True, mode=0o700)
-    env = os.environ.copy()
-    env["PATH"] = runtime_path
-    env.update({
-        "HOSTNAME": "127.0.0.1", "PORT": str(port), "HOME": str(scratch_home),
-        "DATA_DIR": str(scratch_data), "DISABLE_BACKGROUND_TOKEN_REFRESH": "1",
-        "MODEL_CATALOG_SYNC": "off",
-    })
     log_path = scratch_root / "candidate.log"
-    with log_path.open("ab", buffering=0) as log:
-        process = subprocess.Popen(service.child_command(release), cwd=release["path"], env=env,
-                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
+    read_fd, write_fd = os.pipe()
+    process = service.spawn_child(
+        release, port, "127.0.0.1", scratch_data, scratch_home, log_path,
+        (read_fd, write_fd), {"PATH": runtime_path, "DISABLE_BACKGROUND_TOKEN_REFRESH": "1",
+                              "MODEL_CATALOG_SYNC": "off"},
+    )
+    os.close(read_fd)
+    record = None
     try:
-        deadline = time.monotonic() + timeout
-        successes = 0
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise ReleaseError(f"Candidate exited {process.returncode}; inspect {log_path}")
-            if service.health(port):
-                successes += 1
-                if successes >= 3:
-                    return
-            else:
-                successes = 0
-            time.sleep(.5)
-        raise ReleaseError(f"Candidate readiness deadline exceeded; inspect {log_path}")
+        record = service.capture_child_identity(process.pid, release, port)
+        os.write(write_fd, b"1")
+        if not service.wait_ready(record, timeout):
+            raise ReleaseError(f"Candidate readiness/identity deadline exceeded; inspect {log_path}")
     finally:
-        if process.poll() is None:
-            os.killpg(process.pid, 15)
+        os.close(write_fd)
+        if record is not None:
             try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, 9)
-                process.wait(timeout=5)
+                service.stop_child(record)
+            except service.ServiceError:
+                if process.poll() is None:
+                    raise
+        elif process.poll() is None:
+            os.killpg(process.pid, 9)
+            process.wait(timeout=5)
+        if service.listener_pids(port):
+            raise ReleaseError("Candidate left a scratch listener behind")
 
 
 def stage(args) -> None:

@@ -384,10 +384,12 @@ def child_command(release: dict[str, Any]) -> list[str]:
 
 
 def spawn_child(release: dict[str, Any], port: int, hostname: str, data_dir: Path,
-                home: Path, log_path: Path, start_gate: tuple[int, int] | None = None) -> subprocess.Popen[bytes]:
+                home: Path, log_path: Path, start_gate: tuple[int, int] | None = None,
+                extra_environment: dict[str, str] | None = None) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     environment.update({"HOSTNAME": hostname, "PORT": str(port), "HOME": str(home),
                         "DATA_DIR": str(data_dir)})
+    environment.update(extra_environment or {})
     log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     log = log_path.open("ab", buffering=0)
     try:
@@ -576,7 +578,8 @@ def rollback(store: StateStore, config: dict[str, Any], reason: str) -> dict[str
         locked["qualified"] = target_name
         locked["transition"] = None
         locked["phase"] = "healthy"
-        locked["failures"] = []
+        if not reason.startswith("Crash-loop budget"):
+            locked["failures"] = []
         locked["child"] = record
         _diagnostic(locked, f"Rollback healthy: {target_name}")
     return record
@@ -664,6 +667,13 @@ def monitor(store: StateStore, config: dict[str, Any], record: dict[str, Any]) -
         with store.locked() as state:
             count = _record_failure(state, "Child exited or local liveness failed")
         if count >= int(config["failure_budget"]):
+            state = store.read()
+            if state.get("current") in {state.get("qualified"), state.get("last_good")}:
+                with store.locked() as locked:
+                    locked["phase"] = "degraded"
+                    _diagnostic(locked, "Qualified baseline crash-loop exhausted; slow retry only")
+                time.sleep(float(config["degraded_interval"]))
+                return
             rollback(store, config, "Crash-loop budget exhausted")
             return
         with contextlib.suppress(ServiceError):
@@ -756,11 +766,22 @@ def validate_plist(plist: Path, service: str, expected_arguments: list[str] | No
         raise ServiceError("Plist ProgramArguments changed")
 
 
+def loaded_job_matches(service: str, expected_arguments: list[str]) -> bool:
+    result = launchctl("print", service, timeout=5)
+    if result.returncode:
+        return False
+    # launchctl print renders each argument on its own; exact membership plus
+    # argument count avoids adopting a same-label unrelated job.
+    return all(argument in result.stdout for argument in expected_arguments)
+
+
 def bootstrap_one(domain: str, service: str, plist: Path, name: str,
                   attempts: int = 3, expected_digest: str | None = None,
                   expected_arguments: list[str] | None = None) -> str:
     errors: list[str] = []
     validate_plist(plist, service, expected_arguments, expected_digest)
+    if expected_arguments and loaded_job_matches(service, expected_arguments):
+        return name
     for attempt in range(attempts):
         result = launchctl("bootstrap", domain, str(plist))
         if result.returncode == 0 and _loaded(service):
@@ -819,9 +840,29 @@ def prove_install_health(store: StateStore, expected: str, timeout: float) -> bo
         except ServiceError:
             return False
     else:
+        transaction = state.get("install_transaction") or {}
+        fallback_path = Path(transaction.get("fallback_plist", ""))
+        fallback_arguments = transaction.get("fallback_arguments")
+        try:
+            validate_plist(fallback_path, state["guard"]["service"], fallback_arguments,
+                           transaction.get("original_digest"))
+        except (ServiceError, OSError):
+            return False
+        # ponytail: fallback supports the existing direct Node custom-server form;
+        # wrappers need a separately reviewed identity adapter.
+        if not isinstance(fallback_arguments, list) or len(fallback_arguments) < 3:
+            return False
+        expected_node = str(Path(fallback_arguments[0]).resolve())
+        expected_script = Path(fallback_arguments[-1]).resolve()
         service_name = state["guard"]["service"]
         job_pid = loaded_job_pid(service_name)
         if job_pid is None or not listeners:
+            return False
+        try:
+            snapshot = process_snapshot(job_pid)
+        except ServiceError:
+            return False
+        if expected_node not in snapshot["texts"] or snapshot["cwd"] != str(expected_script.parent):
             return False
         if not all(pid_descends_from(pid, job_pid) for pid in listeners):
             return False
@@ -850,11 +891,19 @@ def guard(service_dir: Path) -> None:
                         locked["phase"] = "installing"
                     phase = "bootstrapping-stable"
                 if phase == "bootstrapping-stable":
-                    selected = bootstrap_with_fallback(
-                        domain, service, Path(transaction["stable_plist"]),
-                        Path(transaction["fallback_plist"]) if transaction.get("fallback_plist") else None,
-                        int(guard_config.get("bootstrap_attempts", 3)),
-                    )
+                    stable_plist = Path(transaction["stable_plist"])
+                    validate_plist(stable_plist, service)
+                    stable_arguments = plistlib.loads(stable_plist.read_bytes())["ProgramArguments"]
+                    if _loaded(service):
+                        if not loaded_job_matches(service, stable_arguments):
+                            raise ServiceError("Unexpected gateway job loaded during migration")
+                        selected = "stable"
+                    else:
+                        selected = bootstrap_with_fallback(
+                            domain, service, stable_plist,
+                            Path(transaction["fallback_plist"]) if transaction.get("fallback_plist") else None,
+                            int(guard_config.get("bootstrap_attempts", 3)),
+                        )
                     with store.locked() as locked:
                         locked["install_transaction"]["loaded"] = selected
                         locked["install_transaction"]["phase"] = "loaded"
