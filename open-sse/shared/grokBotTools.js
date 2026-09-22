@@ -69,7 +69,7 @@ export function extractJsonObjectWithKey(text, key) {
       const ch = s[j];
       if (inString) {
         if (escape) escape = false;
-        else if (ch === "\\\\") escape = true;
+        else if (ch === "\\") escape = true;
         else if (ch === '"') inString = false;
         continue;
       }
