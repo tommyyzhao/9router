@@ -149,6 +149,24 @@ def offline_checks():
         with patch.object(release_tool.service, "validate_release", return_value=staged):
             expect_error("compatibility", release_tool.promote, args)
 
+    # Targeted reviewer repro: rollback keeps future qualified pointer coherent.
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        store = service.StateStore(base / "state.json")
+        store.create({
+            "current": "candidate", "qualified": "candidate", "last_good": "baseline",
+            "transition": {"rollback": "baseline"}, "child": None,
+            "releases": {"baseline": {"path": "baseline"}},
+            "config": {"port": _free_port(), "startup_timeout": 1},
+        })
+        fake_record = {"pid": 42}
+        with patch.object(service, "reconcile_record", return_value=None), \
+             patch.object(service, "start_selected", return_value=fake_record), \
+             patch.object(service, "wait_ready", return_value=True):
+            service.rollback(store, store.read()["config"], "targeted repro")
+        pointers = store.read()
+        assert pointers["current"] == pointers["qualified"] == "baseline"
+
     # Targeted reviewer repro: fallback health never accepts an unrelated listener.
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
