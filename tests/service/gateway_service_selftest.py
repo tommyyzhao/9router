@@ -149,6 +149,33 @@ def offline_checks():
         with patch.object(release_tool.service, "validate_release", return_value=staged):
             expect_error("compatibility", release_tool.promote, args)
 
+    # Liveness probes fail closed; only a confirmed absent PID clears ownership.
+    with patch.object(service, "process_snapshot", side_effect=service.ServiceError("probe denied")), \
+         patch.object(service, "_pid_absent", return_value=False):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            store = service.StateStore(base / "state.json")
+            port = _free_port()
+            record = {"pid": 42, "start": "start"}
+            store.create({"child": record, "config": {"port": port}})
+            with patch.object(service, "listener_pids", return_value=set()):
+                expect_error("Ambiguous live", service.reconcile_record, store, port)
+            assert store.read()["child"] == record
+    with patch.object(service, "process_snapshot", side_effect=service.ServiceError("probe denied")), \
+         patch.object(service, "_pid_absent", return_value=True):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            store = service.StateStore(base / "state.json")
+            port = _free_port()
+            record = {"pid": 42, "start": "start"}
+            store.create({"child": record, "config": {"port": port}})
+            with patch.object(service, "listener_pids", return_value=set()):
+                assert service.reconcile_record(store, port) is None
+            assert store.read()["child"] is None
+    with patch.object(service, "_pid_absent", return_value=False), \
+         patch.object(service, "process_snapshot", side_effect=service.ServiceError("probe denied")):
+        assert service.wait_gone({"pid": 42, "start": "start"}, .01) is False
+
     # Targeted reviewer repro: rollback keeps future qualified pointer coherent.
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
@@ -167,11 +194,58 @@ def offline_checks():
         pointers = store.read()
         assert pointers["current"] == pointers["qualified"] == "baseline"
 
+    # Successful stop clears only after proven absence.
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        release = base / "release"
+        release.mkdir()
+        script = release / "child.py"
+        script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+        child = subprocess.Popen([sys.executable, str(script)], cwd=release, start_new_session=True)
+        try:
+            snapshot = service.process_snapshot(child.pid)
+            record = {"pid": child.pid, "start": snapshot["start"], "pgid": snapshot["pgid"],
+                      "session": snapshot["session"], "node": snapshot["texts"][0],
+                      "cwd": snapshot["cwd"], "release": str(release), "release_digest": "test", "port": _free_port()}
+            def direct_signal(_record, sig, **_kwargs):
+                os.kill(_record["pid"], sig)
+            with patch.object(service, "prove_child"), patch.object(service, "signal_child", side_effect=direct_signal):
+                service.stop_child(record, graceful=.1)
+            assert child.poll() is not None
+        finally:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=3)
+
     # Targeted reviewer repro: loaded argv must be an exact ordered block.
     fake_print = subprocess.CompletedProcess([], 0,
         "arguments = {\n  /usr/bin/python-wrapper\n  --supervisor-helper\n}\n", "")
     with patch.object(service, "launchctl", return_value=fake_print):
         assert service.loaded_job_matches("gui/501/test", ["/usr/bin/python", "--supervisor"]) is False
+
+    # Stop failure retains durable child ownership in restart and budget paths.
+    stop_failure = service.ServiceError("stop denied")
+    for exhausted in (False, True):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            store = service.StateStore(base / "state.json")
+            record = {"pid": 42, "start": "start"}
+            now = time.time()
+            store.create({
+                "phase": "healthy", "current": "candidate", "qualified": "candidate",
+                "last_good": "baseline", "rollback_attempted": "baseline" if exhausted else None,
+                "failures": [now] * (3 if exhausted else 0), "transition": None,
+                "child": record, "config": {"port": _free_port(), "health_interval": 0,
+                    "health_failures": 1, "failure_budget": 3, "max_backoff": 0, "degraded_interval": 0},
+            })
+            with patch.object(service.time, "sleep"), patch.object(service, "prove_child", side_effect=service.ServiceError("dead")), \
+                 patch.object(service, "stop_child", side_effect=stop_failure), \
+                 patch.object(service, "rollback", return_value=None):
+                service.monitor(store, store.read()["config"], record)
+            state = store.read()
+            assert state["child"] == record
+            assert state["phase"] == "degraded"
+            assert "stop failed" in state["diagnostic"]
 
     # Targeted reviewer repro: candidate crash budget chooses distinct last_good.
     with tempfile.TemporaryDirectory() as raw:
