@@ -643,6 +643,7 @@ def apply_transition(store: StateStore, config: dict[str, Any]) -> dict[str, Any
             locked["transition"] = None
             locked["phase"] = "healthy"
             locked["failures"] = []
+            locked["rollback_attempted"] = None
             _diagnostic(locked, f"Promotion qualified: {target_name}")
         return record
     if phase in {"rollback-starting", "rollback-probation"}:
@@ -668,13 +669,22 @@ def monitor(store: StateStore, config: dict[str, Any], record: dict[str, Any]) -
             count = _record_failure(state, "Child exited or local liveness failed")
         if count >= int(config["failure_budget"]):
             state = store.read()
-            if state.get("current") in {state.get("qualified"), state.get("last_good")}:
+            prior = state.get("last_good")
+            if prior and prior != state.get("current") and not state.get("rollback_attempted"):
                 with store.locked() as locked:
-                    locked["phase"] = "degraded"
-                    _diagnostic(locked, "Qualified baseline crash-loop exhausted; slow retry only")
-                time.sleep(float(config["degraded_interval"]))
+                    locked["rollback_attempted"] = prior
+                    if not locked.get("transition"):
+                        locked["transition"] = {"phase": "rollback-starting", "rollback": prior,
+                                                "target": locked["current"], "id": "crash-loop"}
+                rollback(store, config, "Crash-loop budget exhausted")
                 return
-            rollback(store, config, "Crash-loop budget exhausted")
+            with contextlib.suppress(ServiceError):
+                stop_child(record)
+            with store.locked() as locked:
+                locked["child"] = None
+                locked["phase"] = "degraded"
+                _diagnostic(locked, "Qualified fallback crash-loop exhausted; slow restart")
+            time.sleep(float(config["degraded_interval"]))
             return
         with contextlib.suppress(ServiceError):
             stop_child(record)
@@ -770,9 +780,14 @@ def loaded_job_matches(service: str, expected_arguments: list[str]) -> bool:
     result = launchctl("print", service, timeout=5)
     if result.returncode:
         return False
-    # launchctl print renders each argument on its own; exact membership plus
-    # argument count avoids adopting a same-label unrelated job.
-    return all(argument in result.stdout for argument in expected_arguments)
+    lines = result.stdout.splitlines()
+    try:
+        start = next(index for index, line in enumerate(lines) if line.strip() == "arguments = {") + 1
+        end = next(index for index in range(start, len(lines)) if lines[index].strip() == "}")
+    except StopIteration:
+        return False
+    actual = [line.strip().removesuffix(",") for line in lines[start:end] if line.strip()]
+    return actual == expected_arguments
 
 
 def bootstrap_one(domain: str, service: str, plist: Path, name: str,

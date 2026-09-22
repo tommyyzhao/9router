@@ -136,6 +136,7 @@ def install(args) -> None:
         "transition": None,
         "child": None,
         "failures": [],
+        "rollback_attempted": None,
         "diagnostic": "Installed; guard migration not armed",
         "diagnostic_at": time.time(),
         "config": _config(args, service_dir, releases_dir, child_log),

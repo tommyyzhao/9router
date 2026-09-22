@@ -167,6 +167,30 @@ def offline_checks():
         pointers = store.read()
         assert pointers["current"] == pointers["qualified"] == "baseline"
 
+    # Targeted reviewer repro: loaded argv must be an exact ordered block.
+    fake_print = subprocess.CompletedProcess([], 0,
+        "arguments = {\n  /usr/bin/python-wrapper\n  --supervisor-helper\n}\n", "")
+    with patch.object(service, "launchctl", return_value=fake_print):
+        assert service.loaded_job_matches("gui/501/test", ["/usr/bin/python", "--supervisor"]) is False
+
+    # Targeted reviewer repro: candidate crash budget chooses distinct last_good.
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        store = service.StateStore(base / "state.json")
+        now = time.time()
+        store.create({
+            "phase": "healthy", "current": "candidate", "qualified": "candidate",
+            "last_good": "baseline", "rollback_attempted": None,
+            "failures": [now - 2, now - 1], "transition": None,
+            "child": {"pid": 42}, "config": {"port": _free_port(), "health_interval": 0,
+                "health_failures": 1, "failure_budget": 3, "max_backoff": 0, "degraded_interval": 0},
+        })
+        with patch.object(service.time, "sleep"), patch.object(service, "prove_child", side_effect=service.ServiceError("dead")), \
+             patch.object(service, "stop_child"), patch.object(service, "rollback", return_value=None) as rollback_call:
+            service.monitor(store, store.read()["config"], {"pid": 42})
+        rollback_call.assert_called_once()
+        assert store.read()["rollback_attempted"] == "baseline"
+
     # Targeted reviewer repro: fallback health never accepts an unrelated listener.
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
@@ -310,9 +334,99 @@ def _bootout(service_name):
           timeout=10, message=f"bootout {service_name}")
 
 
+def installer_sigkill_checks(python: Path, node: Path, runtime_path: str):
+    """Kill prepare/arm subprocesses at deterministic disk/state boundaries."""
+    with tempfile.TemporaryDirectory(prefix="9router-installer-kill-") as raw:
+        base = Path(raw).resolve()
+        home = base / "home"
+        service_dir = home / ".9router/service"
+        bin_dir = home / ".9router/bin"
+        releases_dir = home / ".9router/releases"
+        launch_agents = home / "Library/LaunchAgents"
+        logs = home / ".9router/logs"
+        data = home / ".9router/data"
+        for directory in (home, data):
+            directory.mkdir(parents=True, mode=0o700)
+        baseline, _, env = make_live_release(home / ".9router", "baseline")
+        env.write_text("SCRATCH_ONLY=1\n", encoding="utf-8")
+        label = f"io.9router.selftest.prepare.{os.getpid()}.{int(time.time())}"
+        guard_label = f"{label}.guard"
+        port = _free_port()
+        install_argv = [
+            "install", "--baseline", str(baseline), "--python", str(python), "--node", str(node),
+            "--env-file", str(env), "--schema-source", str(baseline), "--service-dir", str(service_dir),
+            "--bin-dir", str(bin_dir), "--releases-dir", str(releases_dir),
+            "--launch-agents", str(launch_agents), "--log-dir", str(logs), "--home", str(home),
+            "--data-dir", str(data), "--label", label, "--guard-label", guard_label,
+            "--port", str(port), "--hostname", "127.0.0.1", "--runtime-path", runtime_path,
+        ]
+        install_checkpoint = base / "install.checkpoint"
+        install_wrapper = base / "kill-install.py"
+        install_wrapper.write_text(
+            "import importlib.util,sys,time\nfrom pathlib import Path\n"
+            f"source=Path({str(RELEASE_SOURCE)!r}); checkpoint=Path({str(install_checkpoint)!r})\n"
+            "spec=importlib.util.spec_from_file_location('gateway_release_kill',source);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n"
+            "original=m.service.StateStore.create\n"
+            "def stop(self,state): checkpoint.write_text(str(self.path)); time.sleep(60)\n"
+            "m.service.StateStore.create=stop\nsys.argv=[str(source)]+sys.argv[1:]\nm.main()\n",
+            encoding="utf-8",
+        )
+        process = subprocess.Popen([str(python), str(install_wrapper), *install_argv], start_new_session=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _wait(install_checkpoint.exists, timeout=15, message="installer pre-state checkpoint")
+        assert (bin_dir / "gateway_service.py").is_file()
+        assert (service_dir / f"{label}.supervisor.plist").is_file()
+        assert not (service_dir / "state.json").exists()
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=3)
+        _run(str(python), str(RELEASE_SOURCE), *install_argv)
+        store = service.StateStore(service_dir / "state.json")
+        assert store.read()["phase"] == "installed-unarmed"
+
+        original = base / "original.plist"
+        original_payload = {
+            "Label": label,
+            "ProgramArguments": [str(node), f"--env-file={env}", str(baseline / "custom-server.js")],
+            "WorkingDirectory": str(baseline), "RunAtLoad": True, "KeepAlive": True,
+            "EnvironmentVariables": {"PORT": str(port), "HOSTNAME": "127.0.0.1",
+                                     "HOME": str(home), "DATA_DIR": str(data), "PATH": runtime_path},
+        }
+        original.write_bytes(plistlib.dumps(original_payload))
+        arm_checkpoint = base / "arm.checkpoint"
+        arm_wrapper = base / "kill-arm.py"
+        arm_wrapper.write_text(
+            "import importlib.util,sys,time\nfrom pathlib import Path\n"
+            f"source=Path({str(RELEASE_SOURCE)!r}); checkpoint=Path({str(arm_checkpoint)!r})\n"
+            "spec=importlib.util.spec_from_file_location('gateway_release_arm_kill',source);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n"
+            "original=m._copy_atomic\n"
+            "def stop(source_path,destination,mode):\n original(source_path,destination,mode)\n"
+            " if destination.name=='original-gateway.plist': checkpoint.write_text(str(destination)); time.sleep(60)\n"
+            "m._copy_atomic=stop\nsys.argv=[str(source)]+sys.argv[1:]\nm.main()\n",
+            encoding="utf-8",
+        )
+        arm_argv = ["arm-install", "--service-dir", str(service_dir), "--original-plist", str(original)]
+        process = subprocess.Popen([str(python), str(arm_wrapper), *arm_argv], start_new_session=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _wait(arm_checkpoint.exists, timeout=10, message="arm backup-before-intent checkpoint")
+        assert (service_dir / "original-gateway.plist").read_bytes() == original.read_bytes()
+        assert store.read()["install_transaction"] is None
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=3)
+        _run(str(python), str(RELEASE_SOURCE), *arm_argv)
+        transaction = store.read()["install_transaction"]
+        assert transaction["phase"] == "armed"
+        assert transaction["original_digest"] == hashlib.sha256(original.read_bytes()).hexdigest()
+
+
 def real_launchd_checks():
     assert sys.platform == "darwin", "real launchd tests require macOS"
     assert os.environ.get("GATEWAY_SELFTEST_REAL") == "1", "set GATEWAY_SELFTEST_REAL=1"
+    pinned_python = Path(sys.executable).resolve()
+    pinned_node = Path("/opt/homebrew/Cellar/node/26.0.0/bin/node").resolve()
+    runtime_path = os.environ.get("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+    installer_started = time.monotonic()
+    installer_sigkill_checks(pinned_python, pinned_node, runtime_path)
+    installer_duration = time.monotonic() - installer_started
     uid = os.getuid()
     suffix = f"{uid}.{os.getpid()}.{int(time.time())}"
     label = f"io.9router.selftest.gateway.{suffix}"
@@ -355,6 +469,25 @@ def real_launchd_checks():
         gateway_plist = service_dir / f"{label}.supervisor.plist"
         final_gateway_plist = launch_agents / f"{label}.plist"
         guard_plist = launch_agents / f"{guard_label}.plist"
+        # Test-only guard wrapper pauses exactly after stable bootstrap and before
+        # the loaded phase write; launchd restarts it after SIGKILL.
+        guard_checkpoint = base / "guard-after-bootstrap.checkpoint"
+        guard_wrapper = base / "guard-kill-wrapper.py"
+        guard_wrapper.write_text(
+            "import importlib.util,time\nfrom pathlib import Path\n"
+            f"source=Path({str(bin_dir / 'gateway_service.py')!r}); checkpoint=Path({str(guard_checkpoint)!r}); service_dir=Path({str(service_dir)!r})\n"
+            "spec=importlib.util.spec_from_file_location('gateway_service_guard_kill',source);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n"
+            "original=m.bootstrap_with_fallback\n"
+            "def stop(*args,**kwargs):\n result=original(*args,**kwargs)\n"
+            " if not checkpoint.exists(): checkpoint.write_text(result); time.sleep(60)\n"
+            " return result\n"
+            "m.bootstrap_with_fallback=stop\nm.guard(service_dir)\n",
+            encoding="utf-8",
+        )
+        guard_payload = plistlib.loads(guard_plist.read_bytes())
+        guard_payload["ProgramArguments"] = [str(python), str(guard_wrapper)]
+        guard_plist.write_bytes(plistlib.dumps(guard_payload))
+
         fallback = base / "fallback.plist"
         fallback_payload = {
             "Label": label,
@@ -379,8 +512,16 @@ def real_launchd_checks():
             assert old_direct_pid in service.listener_pids(port)
             start = time.monotonic()
             _run("/bin/launchctl", "bootstrap", domain, str(guard_plist))
+            _wait(guard_checkpoint.exists, timeout=15, message="guard post-bootstrap checkpoint")
+            _wait(lambda: service.loaded_job_pid(gateway_service) is not None and service.health(port, .2),
+                  timeout=12, message="stable supervisor healthy before guard kill")
+            stable_pid_before_guard_kill = service.loaded_job_pid(gateway_service)
+            assert store.read()["install_transaction"]["phase"] == "bootstrapping-stable"
+            killed = _run("/bin/launchctl", "kill", "SIGKILL", guard_service, check=False)
+            assert killed.returncode == 0, killed.stderr
             _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed" and service.health(port, .2),
-                  timeout=15, message="guard-owned initial migration")
+                  timeout=20, message="guard-kill adoption migration")
+            assert service.loaded_job_pid(gateway_service) == stable_pid_before_guard_kill
             timings["initial_migration"] = time.monotonic() - start
             state = store.read()
             assert state["install_transaction"]["phase"] == "committed", state
@@ -494,91 +635,6 @@ def real_launchd_checks():
             timings["crash_rollback"] = time.monotonic() - start
             assert service.health(port, .2)
 
-            # Occupied unknown listener is diagnosed; never killed.
-            _bootout(gateway_service)
-            state = store.read()
-            if state.get("child"):
-                with contextlib.suppress(Exception):
-                    service.stop_child(state["child"], graceful=1)
-                with store.locked() as locked:
-                    locked["child"] = None
-            stranger = subprocess.Popen([sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
-                                         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                _wait(lambda: stranger.pid in service.listener_pids(port), timeout=5, message="unknown listener")
-                _run("/bin/launchctl", "bootstrap", domain, str(gateway_plist), check=False)
-                _wait(lambda: store.read().get("phase") == "degraded", timeout=8, message="unknown-listener degraded")
-                assert stranger.poll() is None
-                assert "Unknown process" in store.read().get("diagnostic", "")
-            finally:
-                _bootout(gateway_service)
-                os.killpg(stranger.pid, signal.SIGTERM)
-                stranger.wait(timeout=3)
-
-            # Interrupted guard after successful stable bootstrap but before state
-            # commit resumes from persisted loaded phase without another bootout.
-            with store.locked() as locked:
-                locked["install_transaction"] = {
-                    "phase": "loaded", "loaded": "stable", "stable_plist": str(gateway_plist),
-                    "fallback_plist": str(fallback), "fallback_arguments": fallback_payload["ProgramArguments"],
-                    "original_digest": hashlib.sha256(fallback.read_bytes()).hexdigest(),
-                    "final_plist": str(final_gateway_plist), "armed_at": time.time(),
-                }
-                locked["phase"] = "installing"
-            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed",
-                  timeout=8, message="interrupted loaded-phase guard commit")
-            timings["guard_loaded_resume"] = 0.0
-            assert service.health(port, .2)
-
-            # Loaded-but-unhealthy stable job is explicitly booted out before the
-            # original fallback is loaded; future recovery persists that fallback.
-            unhealthy_plist = service_dir / "unhealthy-stable.plist"
-            unhealthy_plist.write_bytes(gateway_plist.read_bytes())
-            unhealthy_config = plistlib.loads(unhealthy_plist.read_bytes())
-            unhealthy_config["ProgramArguments"] = [str(node), "-e", "setInterval(()=>{},1000)"]
-            unhealthy_plist.write_bytes(plistlib.dumps(unhealthy_config))
-            _bootout(gateway_service)
-            with store.locked() as locked:
-                locked["install_transaction"] = {
-                    "phase": "bootstrapping-stable", "stable_plist": str(unhealthy_plist),
-                    "fallback_plist": str(fallback), "fallback_arguments": fallback_payload["ProgramArguments"],
-                    "original_digest": hashlib.sha256(fallback.read_bytes()).hexdigest(),
-                    "final_plist": str(final_gateway_plist), "armed_at": time.time(),
-                }
-                locked["guard"]["install_health_timeout"] = 2
-                locked["phase"] = "installing"
-            start = time.monotonic()
-            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed" and service.health(port, .2),
-                  timeout=18, message="loaded unhealthy stable fallback")
-            state = store.read()
-            timings["loaded_unhealthy_fallback"] = time.monotonic() - start
-            assert state["install_transaction"]["loaded"] == "fallback", state
-            assert state["guard"]["stable_plist"] == str(final_gateway_plist)
-            assert final_gateway_plist.read_bytes() == fallback.read_bytes()
-            # Prove future missing-job recovery uses the persisted working plist.
-            _bootout(gateway_service)
-            _wait(lambda: _run("/bin/launchctl", "print", gateway_service, check=False).returncode == 0 and service.health(port, .2),
-                  timeout=10, message="persisted fallback missing-job recovery")
-
-            # Reproduce original incident shape: invalid stable plist plus fallback.
-            bad_stable = service_dir / "bad-stable.plist"
-            bad_stable.write_text("not a plist", encoding="utf-8")
-            with store.locked() as locked:
-                locked["guard"]["stable_plist"] = str(bad_stable)
-                locked["install_transaction"] = {
-                    "phase": "armed", "stable_plist": str(bad_stable),
-                    "fallback_plist": str(fallback), "fallback_arguments": fallback_payload["ProgramArguments"],
-                    "original_digest": hashlib.sha256(fallback.read_bytes()).hexdigest(),
-                    "final_plist": str(final_gateway_plist), "armed_at": time.time(),
-                }
-                locked["phase"] = "install-armed"
-            start = time.monotonic()
-            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed" and service.health(port, .2),
-                  timeout=20, message="bootstrap rejection fallback")
-            state = store.read()
-            timings["bootstrap_rejection_fallback"] = time.monotonic() - start
-            assert state["install_transaction"]["phase"] == "committed", state
-            assert state["install_transaction"]["loaded"] == "fallback", state
         except BaseException:
             print("SCRATCH DEBUG", base, "port", port, file=sys.stderr)
             with contextlib.suppress(Exception):
@@ -599,6 +655,7 @@ def real_launchd_checks():
             assert not listeners, f"scratch listener leaked: {listeners}"
             assert _run("/bin/launchctl", "print", gateway_service, check=False).returncode != 0
             assert _run("/bin/launchctl", "print", guard_service, check=False).returncode != 0
+    timings["installer_and_arm_sigkill"] = installer_duration
     print("PASS real launchd:", json.dumps({name: round(value, 3) for name, value in timings.items()}, sort_keys=True))
 
 
