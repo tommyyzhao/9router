@@ -233,6 +233,11 @@ export function createSSEStream(options = {}) {
             }
           }
 
+          // Mark [DONE] so flush does not emit a second sentinel
+          if (trimmed.startsWith("data:") && trimmed.slice(5).trim() === "[DONE]") {
+            streamDoneSent = true;
+          }
+
           reqLogger?.appendConvertedChunk?.(output);
           controller.enqueue(sharedEncoder.encode(output));
           // Responses clients (codex CLI) close on response.completed instead of [DONE]
