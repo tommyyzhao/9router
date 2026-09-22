@@ -43,14 +43,23 @@ export function toolProtocolText() {
  * @returns {{ kind: 'tool_calls', toolCalls: Array } | { kind: 'text', text: string }}
  */
 export function parseAssistantCompletion(raw) {
-  const text = String(raw ?? "").trim();
+  let text = String(raw ?? "").trim();
   if (!text) return { kind: "text", text: "" };
 
+  // Unescape common transcript artifacts (double-encoded quotes / newlines)
+  if (text.includes('\\"') && text.includes("tool_calls")) {
+    try {
+      const once = JSON.parse(`"${text.replace(/^"|"$/g, (m, i, s) => (i === 0 || i === s.length - 1 ? "" : m))}"`);
+      if (typeof once === "string" && once.includes("tool_calls")) text = once.trim();
+    } catch {
+      /* keep text */
+    }
+  }
+
   let candidate = text;
-  const fence = candidate.match(/^```(?:json)?\s*([\s\S]*?)```\s*$/i);
+  const fence = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) candidate = fence[1].trim();
 
-  // Prefer whole-string JSON
   const tryParse = (s) => {
     try {
       return JSON.parse(s);
@@ -59,31 +68,37 @@ export function parseAssistantCompletion(raw) {
     }
   };
 
-  let obj = tryParse(candidate);
-  if (!obj) {
-    // Find first {...} that contains tool_calls
-    const start = candidate.indexOf('{"tool_calls"');
-    const start2 = candidate.indexOf('{ "tool_calls"');
-    const idx = start >= 0 ? start : start2;
-    if (idx >= 0) {
-      // brace match
-      let depth = 0;
-      let end = -1;
-      for (let i = idx; i < candidate.length; i++) {
-        const ch = candidate[i];
-        if (ch === "{") depth++;
-        else if (ch === "}") {
-          depth--;
-          if (depth === 0) {
-            end = i;
-            break;
+  const extractToolCallsObj = (s) => {
+    let obj = tryParse(s);
+    if (obj && Array.isArray(obj.tool_calls)) return obj;
+    // Search for tool_calls key (with optional whitespace)
+    const markers = ['"tool_calls"', "'tool_calls'"];
+    let idx = -1;
+    for (const m of markers) {
+      const i = s.indexOf(m);
+      if (i >= 0) {
+        // walk back to opening brace
+        let start = s.lastIndexOf("{", i);
+        if (start < 0) continue;
+        let depth = 0;
+        for (let j = start; j < s.length; j++) {
+          if (s[j] === "{") depth++;
+          else if (s[j] === "}") {
+            depth--;
+            if (depth === 0) {
+              obj = tryParse(s.slice(start, j + 1));
+              if (obj && Array.isArray(obj.tool_calls)) return obj;
+              break;
+            }
           }
         }
+        idx = i;
       }
-      if (end > idx) obj = tryParse(candidate.slice(idx, end + 1));
     }
-  }
+    return null;
+  };
 
+  const obj = extractToolCallsObj(candidate) || extractToolCallsObj(text);
   if (obj && Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0) {
     const toolCalls = obj.tool_calls.map((tc, i) => normalizeToolCall(tc, i)).filter(Boolean);
     if (toolCalls.length) return { kind: "tool_calls", toolCalls };
