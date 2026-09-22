@@ -61,16 +61,26 @@ export function responsesToOpenAICompletion(responseBody, fallbackModel) {
   }
 
   const usage = responseBody.usage || {};
-  const cachedTokens = usage.cached_tokens ?? usage.input_tokens_details?.cached_tokens;
-  const cacheCreationTokens = usage.cache_creation_input_tokens ?? usage.input_tokens_details?.cache_creation_tokens;
+  const inputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+  const hasSeparateCacheCounters = usage.cache_read_input_tokens !== undefined
+    || usage.cache_creation_input_tokens !== undefined;
+  const cacheReadTokens = hasSeparateCacheCounters
+    ? (usage.cache_read_input_tokens ?? 0)
+    : (usage.cached_tokens ?? usage.input_tokens_details?.cached_tokens);
+  const cacheCreationTokens = hasSeparateCacheCounters
+    ? (usage.cache_creation_input_tokens ?? 0)
+    : usage.input_tokens_details?.cache_creation_tokens;
+  const promptTokens = hasSeparateCacheCounters
+    ? inputTokens + cacheReadTokens + cacheCreationTokens
+    : inputTokens;
   const chatUsage = {
-    prompt_tokens: usage.input_tokens ?? usage.prompt_tokens ?? 0,
+    prompt_tokens: promptTokens,
     completion_tokens: usage.output_tokens ?? usage.completion_tokens ?? 0,
-    total_tokens: usage.total_tokens ?? ((usage.input_tokens ?? usage.prompt_tokens ?? 0) + (usage.output_tokens ?? usage.completion_tokens ?? 0))
+    total_tokens: usage.total_tokens ?? (promptTokens + (usage.output_tokens ?? usage.completion_tokens ?? 0))
   };
-  if (cachedTokens !== undefined || cacheCreationTokens !== undefined) {
+  if (cacheReadTokens !== undefined || cacheCreationTokens !== undefined) {
     chatUsage.prompt_tokens_details = {
-      ...(cachedTokens !== undefined ? { cached_tokens: cachedTokens } : {}),
+      ...(cacheReadTokens !== undefined ? { cached_tokens: cacheReadTokens } : {}),
       ...(cacheCreationTokens !== undefined ? { cache_creation_tokens: cacheCreationTokens } : {})
     };
   }
