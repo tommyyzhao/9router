@@ -314,17 +314,40 @@ export const KEYCHAIN_ACCOUNT = "Grok Bot Key";
  * Checksum not strictly required for GetMe unary.
  */
 export const CHAT_PATH_PROBE = {
-  status: "blocked",
+  status: "send_ok",
+  next: "watch_pending",
+  updatedAt: "2026-09-21",
   unaryDashboardOk: true,
   unaryAiServiceOk: true,
-  agentRunSandRejected: true,
-  chatServiceVersionGated: true,
-  inferenceUnauthenticated: true,
   preferredContentTypeUnary: "application/proto",
   preferredClientType: "sand",
   preferredClientSource: "sand-desktop",
+  primary: "GrokBotService.SendGrokBotUserMessage",
+  proven: {
+    send: "Desktop sand-secrets JWT + sand headers → Send into agent (JSON + application/proto)",
+    auth: "decryptGrokBotDesktopCredentials; buildCursorHeaders sand + sand-desktop; api2.cursor.sh",
+  },
+  out: [
+    "GetGrokBotSendStatus",
+    "WatchGrokBotTranscripts",
+    "ListGrokBotTranscriptEntries",
+  ],
+  control: "InterruptGrokBotAgentRun",
+  ephemeralPlan: "docs/plans/2026-09-21-grok-bot-ephemeral-harness.md",
+  ephemeral: {
+    harness: "TEMPORAL",
+    introductionSuppressed: true,
+    kickstartRequested: false,
+    persona: "9router-worker",
+    envelope: "open-sse/shared/grokBotEnvelope.js",
+  },
+  obsoletePaths: [
+    "AgentService/Run (sand rejected)",
+    "ChatService/StreamUnified (version-gated)",
+    "InferenceService/Stream (unauthenticated for session JWT)",
+  ],
   note:
-    "Decrypt + store works. Do not claim chat works until Agent/Inference/Chat stream probe succeeds with a supported client version.",
+    "Send proven. Next: ephemeral TEMPORAL create → Watch/List transcripts → OpenAI SSE. Do not route via SFC/BOX personal agents.",
 };
 
 /**

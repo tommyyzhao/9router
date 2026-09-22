@@ -5,6 +5,8 @@
 **Harness:** `/Applications/Grok Bot.app` (Anysphere Sand white-label)
 **Branch:** `feat/grok-bot-desktop-discover` (PR-A discover → PR-B decrypt+probe)
 
+**Ephemeral /v1 plan:** [`2026-09-21-grok-bot-ephemeral-harness.md`](./2026-09-21-grok-bot-ephemeral-harness.md)
+
 LT confirmed: Grok Bot.app Desktop, **not** Grok Build CLI (`grok-cli`).
 
 ## 0. Product finding

@@ -9,8 +9,7 @@
  *
  * PR-A: discover API (GET auto-import) — schema only.
  * PR-B: Keychain + OSCrypt v10 decrypt → POST auto-import stores connection.
- *       Executor is wired but chat path is honestly blocked pending stream probe
- *       (AgentService.Run rejects sand; ChatService version-gated; Inference unauth).
+ *       Executor: ephemeral TEMPORAL harness (create→Send→list→SSE→GC).
  */
 export default {
   id: "grok-bot",
@@ -27,7 +26,7 @@ export default {
     textIcon: "GB",
     website: "https://grok.com",
     notice: {
-      text: "Import a signed-in Grok Bot.app Desktop session (Anysphere Sand). Decrypt+store works; chat/stream path still probe-blocked (see plan PR-B). Distinct from Grok Build CLI and Grok Web cookie.",
+      text: "Import a signed-in Grok Bot.app Desktop session (Anysphere Sand). Desktop import + ephemeral TEMPORAL /v1 (create→Send→transcript→SSE). See docs/plans/2026-09-21-grok-bot-ephemeral-harness.md. Distinct from Grok Build CLI and Grok Web cookie.",
       signupUrl: "https://grok.com",
     },
   },
@@ -57,6 +56,6 @@ export default {
     chatEndpoint: "/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
     modelsEndpoint: "/aiserver.v1.AiService/AvailableModels",
     authMethod: "grok-bot-desktop-import",
-    chatPathStatus: "blocked",
+    chatPathStatus: "send_ok",
   },
 };

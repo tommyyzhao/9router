@@ -1,20 +1,20 @@
+import crypto from "node:crypto";
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
 import { CHAT_PATH_PROBE } from "../shared/grokBotAccount.js";
+import { runEphemeralCompletion } from "../shared/grokBotEphemeral.js";
+import { chatChunkSse } from "../utils/sse.js";
+import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
 
 /**
- * Grok Bot Desktop executor (PR-B spike).
+ * Grok Bot Desktop executor — ephemeral TEMPORAL harness.
  *
- * Reuses Cursor Connect/checksum helpers with clientType=sand when building
- * headers, but refuses to claim a working chat path: live probe (2026-09-21)
- * showed AgentService.Run rejects sand traffic, ChatService returns an
- * Update-Required version gate, and InferenceService.Stream is unauthenticated
- * for the Sand session JWT. Unary Dashboard/AiService calls succeed.
+ * /v1/chat/completions → create TEMPORAL worker → enveloped Send → list transcript
+ * → OpenAI SSE/JSON → delete worker. Never routes through SFC / personal BOX agents.
  *
- * TODO(PR-C): once a supported stream path is confirmed, delegate to
- * CursorExecutor (or InferenceService) with sand headers.
+ * See docs/plans/2026-09-21-grok-bot-ephemeral-harness.md
  */
 export class GrokBotDesktopExecutor extends BaseExecutor {
   constructor() {
@@ -22,13 +22,9 @@ export class GrokBotDesktopExecutor extends BaseExecutor {
   }
 
   buildUrl() {
-    return `${this.config?.baseUrl || "https://api2.cursor.sh"}${this.config?.chatPath || "/aiserver.v1.ChatService/StreamUnifiedChatWithTools"}`;
+    return `${this.config?.baseUrl || "https://api2.cursor.sh"}/aiserver.v1.GrokBotService/SendGrokBotUserMessage`;
   }
 
-  /**
-   * Sand-flavored Cursor headers (for future stream wiring / manual probes).
-   * Not used for a live chat path until CHAT_PATH_PROBE.status !== "blocked".
-   */
   buildHeaders(credentials) {
     const accessToken = credentials.accessToken;
     const machineId = credentials.providerSpecificData?.machineId;
@@ -39,36 +35,119 @@ export class GrokBotDesktopExecutor extends BaseExecutor {
     return buildCursorHeaders(accessToken, machineId, ghostMode, {
       clientType: "sand",
       clientSource: "sand-desktop",
-      clientVersion: "sand-desktop",
+      clientVersion: "0.57.1",
     });
   }
 
-  async execute(_args) {
-    const probe = CHAT_PATH_PROBE;
-    return new Response(
-      JSON.stringify({
-        error: {
-          message:
-            "Grok Bot Desktop chat path not yet available. Decrypt/import works; " +
-            "api2.cursor.sh AgentService.Run rejects clientType=sand, ChatService is " +
-            "version-gated (Update Required), InferenceService.Stream unauthenticated. " +
-            "See docs/plans/2026-09-21-grok-bot-desktop-integration.md (PR-B probe).",
-          type: "grok_bot_chat_path_blocked",
-          code: "probe_required",
-          probe: {
-            status: probe.status,
-            unaryDashboardOk: probe.unaryDashboardOk,
-            agentRunSandRejected: probe.agentRunSandRejected,
-            chatServiceVersionGated: probe.chatServiceVersionGated,
-            inferenceUnauthenticated: probe.inferenceUnauthenticated,
+  async execute({ model, body, stream, credentials, signal, log }) {
+    const accessToken = credentials?.accessToken;
+    const machineId = credentials?.providerSpecificData?.machineId;
+    if (!accessToken || !machineId) {
+      return {
+        response: new Response(
+          JSON.stringify({
+            error: {
+              message: "Grok Bot Desktop connection missing accessToken or machineId. Re-run Desktop auto-import.",
+              type: "grok_bot_credentials",
+              code: "missing_credentials",
+              probe: { status: CHAT_PATH_PROBE.status, next: CHAT_PATH_PROBE.next },
+            },
+          }),
+          { status: HTTP_STATUS.UNAUTHORIZED || 401, headers: { "Content-Type": "application/json" } },
+        ),
+      };
+    }
+
+    const messages = Array.isArray(body?.messages) ? body.messages : [];
+    const modelId = model || body?.model || "default";
+    const base = this.config?.baseUrl || "https://api2.cursor.sh";
+
+    let result;
+    try {
+      result = await runEphemeralCompletion({
+        accessToken,
+        machineId,
+        messages,
+        base,
+        signal,
+        log,
+      });
+    } catch (e) {
+      const status = e?.status || HTTP_STATUS.BAD_GATEWAY || 502;
+      return {
+        response: new Response(
+          JSON.stringify({
+            error: {
+              message: e?.message || "Ephemeral Grok Bot completion failed",
+              type: "grok_bot_ephemeral",
+              code: e?.code || "ephemeral_failed",
+              probe: { status: CHAT_PATH_PROBE.status, next: CHAT_PATH_PROBE.next },
+            },
+          }),
+          { status, headers: { "Content-Type": "application/json" } },
+        ),
+      };
+    }
+
+    const id = `chatcmpl-${crypto.randomUUID().slice(0, 24)}`;
+    const created = Math.floor(Date.now() / 1000);
+
+    if (!stream) {
+      const payload = {
+        id,
+        object: "chat.completion",
+        created,
+        model: modelId,
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: result.text },
+            finish_reason: "stop",
           },
-        },
-      }),
-      {
-        status: HTTP_STATUS.BAD_REQUEST || 400,
-        headers: { "Content-Type": "application/json" },
+        ],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      };
+      return {
+        response: new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      };
+    }
+
+    const encoder = new TextEncoder();
+    const responseStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            chatChunkSse({
+              id,
+              created,
+              model: modelId,
+              delta: { role: "assistant", content: result.text },
+              finishReason: null,
+            }),
+          ),
+        );
+        controller.enqueue(
+          encoder.encode(
+            chatChunkSse({
+              id,
+              created,
+              model: modelId,
+              delta: {},
+              finishReason: "stop",
+            }),
+          ),
+        );
+        controller.enqueue(encoder.encode(SSE_DONE));
+        controller.close();
       },
-    );
+    });
+
+    return {
+      response: new Response(responseStream, { headers: SSE_HEADERS }),
+    };
   }
 }
 
