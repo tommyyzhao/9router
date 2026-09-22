@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from unittest.mock import patch
 
@@ -74,8 +75,9 @@ def make_live_release(base: Path, name: str, behavior: str = "healthy") -> tuple
         "if(behavior==='prebind') process.exit(42);\n"
         "const server=http.createServer((req,res)=>{\n"
         " if(behavior==='hang') return;\n"
-        " res.writeHead(200,{'content-type':'application/json'});res.end('{\\\"ok\\\":true}');\n"
+        " res.writeHead(200,{'content-type':'application/json','connection':'keep-alive','keep-alive':'timeout=120'});res.end('{\\\"ok\\\":true}');\n"
         "});\n"
+        "server.keepAliveTimeout=120000;\n"
         "server.listen(port,'127.0.0.1',()=>{\n"
         " if(behavior==='crash') setTimeout(()=>process.exit(43),1000);\n"
         "});\n",
@@ -240,33 +242,64 @@ def offline_checks():
     with patch.object(service, "launchctl", return_value=fake_print):
         assert service.loaded_job_matches("gui/501/test", ["/usr/bin/python", "--supervisor"]) is False
 
-    # Readiness-stop failures preserve the underlying stop cause.
-    for rollback_path in (False, True):
-        with tempfile.TemporaryDirectory() as raw:
-            base = Path(raw)
-            release, node, env = make_release(base, "baseline")
-            record = {"pid": 42, "start": "start"}
-            release_record = service.validate_release(release, base / "releases", node, env,
-                                                      service.fingerprint_schema(release))
-            store = service.StateStore(base / "state.json")
-            store.create({"phase": "rollback-starting", "current": "candidate", "qualified": "candidate",
-                          "last_good": "baseline", "transition": {"rollback": "baseline"}, "child": record,
-                          "releases": {"baseline": release_record}, "config": {"port": _free_port(),
-                          "startup_timeout": 1, "releases_dir": str(base / "releases"), "hostname": "127.0.0.1",
-                          "data_dir": str(base), "home": str(base), "child_log": str(base / "child.log")}})
-            if rollback_path:
-                with patch.object(service, "reconcile_record", return_value=None), \
-                     patch.object(service, "start_selected", return_value=record), \
-                     patch.object(service, "wait_ready", return_value=False), \
-                     patch.object(service, "stop_child", side_effect=service.ServiceError("stop denied")):
-                    service.rollback(store, store.read()["config"], "rollback test")
+    # Rollback readiness-stop failure preserves the underlying stop cause.
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        release, node, env = make_release(base, "baseline")
+        record = {"pid": 42, "start": "start"}
+        release_record = service.validate_release(release, base / "releases", node, env,
+                                                  service.fingerprint_schema(release))
+        store = service.StateStore(base / "state.json")
+        store.create({"phase": "rollback-starting", "current": "candidate", "qualified": "candidate",
+                      "last_good": "baseline", "transition": {"rollback": "baseline"}, "child": record,
+                      "releases": {"baseline": release_record}, "config": {"port": _free_port(),
+                      "startup_timeout": 1, "releases_dir": str(base / "releases"), "hostname": "127.0.0.1",
+                      "data_dir": str(base), "home": str(base), "child_log": str(base / "child.log")}})
+        with patch.object(service, "reconcile_record", return_value=None), \
+             patch.object(service, "start_selected", return_value=record), \
+             patch.object(service, "wait_ready", return_value=False), \
+             patch.object(service, "stop_child", side_effect=service.ServiceError("stop denied")):
+            service.rollback(store, store.read()["config"], "rollback test")
+        assert "stop denied" in store.read()["diagnostic"]
+
+    # True supervisor startup readiness-stop failure retains persisted child.
+    class StopSupervise(BaseException):
+        pass
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        release, node, env = make_release(base, "healthy")
+        release_record = service.validate_release(release, base / "releases", node, env,
+                                                  service.fingerprint_schema(release))
+        store = service.StateStore(base / "state.json")
+        record = {"pid": 42, "start": "start", "release": release_record["path"],
+                  "release_digest": release_record["digest"]}
+        config = {"port": _free_port(), "current": "healthy", "releases_dir": str(base / "releases"),
+                  "startup_timeout": 1, "failure_budget": 3, "max_backoff": 0,
+                  "degraded_interval": 0, "health_interval": 0}
+        store.create({"phase": "healthy", "current": "healthy", "qualified": "healthy",
+                      "last_good": "healthy", "transition": None, "child": None,
+                      "releases": {"healthy": release_record}, "config": config})
+        def persist_start(start_store, *_args):
+            with start_store.locked() as state:
+                state["child"] = record
+                state["phase"] = "starting"
+            return record
+        with patch.object(service, "recover_interrupted"), \
+             patch.object(service, "apply_transition", return_value=None), \
+             patch.object(service, "start_selected", side_effect=persist_start), \
+             patch.object(service, "wait_ready", return_value=False), \
+             patch.object(service, "stop_child", side_effect=service.ServiceError("startup stop denied")), \
+             patch.object(service.time, "sleep", side_effect=StopSupervise):
+            try:
+                service.supervise(base)
+            except StopSupervise:
+                pass
             else:
-                with patch.object(service, "reconcile_record", return_value=None), \
-                     patch.object(service, "start_selected", return_value=record), \
-                     patch.object(service, "wait_ready", return_value=False), \
-                     patch.object(service, "stop_child", side_effect=service.ServiceError("stop denied")):
-                    service.rollback(store, store.read()["config"], "startup test")
-            assert "stop denied" in store.read()["diagnostic"]
+                raise AssertionError("supervise test did not stop at bounded retry")
+        state = store.read()
+        assert state["child"] == record
+        assert state["phase"] == "degraded"
+        assert "startup stop denied" in state["diagnostic"]
 
     # Retained-child recovery refuses a concurrent phase/transition change.
     with tempfile.TemporaryDirectory() as raw:
@@ -556,6 +589,117 @@ def installer_sigkill_checks(python: Path, node: Path, runtime_path: str):
         assert transaction["original_digest"] == hashlib.sha256(original.read_bytes()).hexdigest()
 
 
+def maintenance_rehearsal_checks(python: Path, runtime_path: str):
+    """Isolated old-supervisor replacement with proven parent and socket continuity."""
+    import http.client
+    with tempfile.TemporaryDirectory(prefix="9router-maintenance-") as raw:
+        base = Path(raw).resolve()
+        home = base / "home"
+        service_dir = home / ".9router/service"
+        bin_dir = home / ".9router/bin"
+        releases_dir = home / ".9router/releases"
+        launch_agents = home / "Library/LaunchAgents"
+        logs = home / ".9router/logs"
+        data = home / ".9router/data"
+        for directory in (home, data):
+            directory.mkdir(parents=True, mode=0o700)
+        healthy, node, env = make_live_release(home / ".9router", "healthy")
+        env.write_text("SCRATCH_ONLY=1\n", encoding="utf-8")
+        uid = os.getuid()
+        label = f"io.9router.selftest.maintenance.{uid}.{os.getpid()}.{int(time.time())}"
+        guard_label = f"{label}.guard"
+        port = _free_port()
+        install_args = [str(RELEASE_SOURCE), "install", "--baseline", str(healthy), "--python", str(python),
+                        "--node", str(node), "--env-file", str(env), "--schema-source", str(healthy),
+                        "--service-dir", str(service_dir), "--bin-dir", str(bin_dir), "--releases-dir", str(releases_dir),
+                        "--launch-agents", str(launch_agents), "--log-dir", str(logs), "--home", str(home),
+                        "--data-dir", str(data), "--label", label, "--guard-label", guard_label, "--port", str(port),
+                        "--runtime-path", runtime_path, "--hostname", "127.0.0.1", "--startup-timeout", "8",
+                        "--probation", "2", "--health-interval", ".25", "--health-failures", "2",
+                        "--failure-budget", "3", "--max-backoff", "1", "--degraded-interval", "2",
+                        "--guard-interval", ".5", "--bootstrap-attempts", "2"]
+        _run(str(python), *install_args)
+        store = service.StateStore(service_dir / "state.json")
+        gateway_plist = service_dir / f"{label}.supervisor.plist"
+        gateway_service = f"gui/{uid}/{label}"
+        domain = f"gui/{uid}"
+        state = store.read()
+        original_script = bin_dir / "gateway_service.py"
+        patched_bytes = SOURCE.read_bytes()
+        baseline_bytes = subprocess.check_output(["git", "-C", str(ROOT), "show",
+            "fac053ea2ec20dbfc44e519309eb4de86f86c7a9:scripts/service/gateway_service.py"])
+        wrapper = base / "baseline-wrapper.py"
+        marker = base / "injected"
+        maintenance = base / "ownership-maintenance.json"
+        wrapper.write_text(
+            "import importlib.util,os,json,time;from pathlib import Path;"
+            f"source=Path({str(original_script)!r}); marker=Path({str(marker)!r}); maintenance=Path({str(maintenance)!r}); sd=Path({str(service_dir)!r});"
+            "spec=importlib.util.spec_from_file_location('baseline_service',source);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+            "orig=m.monitor;\n"
+            "def monitor(store,config,record):\n"
+            " if not marker.exists():\n"
+            "  marker.write_text('inject');\n"
+            "  with store.locked() as s:\n"
+            "   maintenance.write_text(json.dumps({'child': s['child'], 'current': s['current'], 'qualified': s['qualified']}))\n"
+            "   s['child']=None; s['phase']='degraded'\n"
+            "  return\n"
+            " return orig(store,config,record)\n"
+            "m.monitor=monitor;m.supervise(sd)\n", encoding="utf-8")
+        payload = plistlib.loads(gateway_plist.read_bytes())
+        payload["ProgramArguments"] = [str(python), str(wrapper)]
+        gateway_plist.write_bytes(plistlib.dumps(payload))
+        jobs = [gateway_service]
+        keepalive = None
+        try:
+            _run("/bin/launchctl", "bootstrap", domain, str(gateway_plist))
+            _wait(marker.exists, timeout=15, message="baseline maintenance injection")
+            _wait(lambda: store.read().get("child") is None and "Unknown process" in store.read().get("diagnostic", ""),
+                  timeout=15, message="baseline unknown-listener degraded state")
+            child = json.loads(maintenance.read_text())["child"]
+            child_snapshot = service.process_snapshot(child["pid"])
+            supervisor = service.loaded_job_pid(gateway_service)
+            assert supervisor is not None and child_snapshot["ppid"] == supervisor
+            keepalive = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            keepalive.auto_open = False
+            keepalive.connect()
+            keepalive.request("GET", "/api/health", headers={"Connection": "keep-alive"})
+            response = keepalive.getresponse()
+            assert response.status == 200 and json.loads(response.read())["ok"] is True
+            sock = keepalive.sock
+            endpoint = sock.getsockname()
+            assert maintenance.exists()
+            service.atomic_write(original_script, patched_bytes, original_script.stat().st_mode & 0o777)
+            _run("/bin/kill", "-KILL", str(supervisor))
+            _wait(lambda: service.loaded_job_pid(gateway_service) not in (None, supervisor), timeout=15,
+                  message="patched supervisor successor")
+            assert store.read().get("child") is None and service.listener_pids(port) == {child["pid"]}
+            helper = base / "interrupted-restore.py"
+            helper.write_text("import json,os,time;from pathlib import Path;"
+                              "p=Path(os.environ['STATE']);m=Path(os.environ['MAINTENANCE']);"
+                              "s=json.loads(p.read_text());s['generation']+=1;s['child']=json.loads(m.read_text())['child'];"
+                              "s['phase']='degraded';t=p.with_name('.restore.tmp');t.write_text(json.dumps(s));os.replace(t,p);time.sleep(60)", encoding="utf-8")
+            process = subprocess.Popen([str(python), str(helper)], env={**os.environ, "STATE": str(store.path), "MAINTENANCE": str(maintenance)}, start_new_session=True)
+            _wait(lambda: store.read().get("child") == child, timeout=5, message="interrupted ownership restore")
+            os.killpg(process.pid, signal.SIGKILL); process.wait(timeout=3)
+            _wait(lambda: store.read().get("phase") == "healthy" and store.read().get("child") == child, timeout=15,
+                  message="retained-child recovery")
+            assert keepalive.sock is sock and keepalive.sock.getsockname() == endpoint
+            keepalive.request("GET", "/api/health", headers={"Connection": "keep-alive"})
+            response = keepalive.getresponse()
+            assert response.status == 200 and json.loads(response.read())["ok"] is True
+            assert keepalive.sock is sock and keepalive.sock.getsockname() == endpoint
+        finally:
+            if keepalive is not None:
+                keepalive.close()
+            for job in jobs:
+                _bootout(job)
+            with contextlib.suppress(Exception):
+                record = store.read().get("child")
+                if record:
+                    service.stop_child(record, graceful=1)
+            _wait(lambda: not service.listener_pids(port), timeout=5, message="maintenance listener cleanup")
+
+
 def real_launchd_checks():
     assert sys.platform == "darwin", "real launchd tests require macOS"
     assert os.environ.get("GATEWAY_SELFTEST_REAL") == "1", "set GATEWAY_SELFTEST_REAL=1"
@@ -675,103 +819,7 @@ def real_launchd_checks():
                   timeout=15, message="missing-job recovery")
             timings["missing_job"] = time.monotonic() - start
 
-            # Supervisor SIGKILL: launchd restarts supervisor; recorded owned child
-            # is reconciled without a second listener or orphan.
-            state = store.read()
-            old_child = state["child"]["pid"]
-            supervisor_pid = int(_run("/bin/launchctl", "print", gateway_service).stdout.split("pid = ", 1)[1].splitlines()[0])
-            before_generation = state["generation"]
-            killed = _run("/bin/launchctl", "kill", "SIGKILL", gateway_service, check=False)
-            if killed.returncode:
-                raise AssertionError(f"scratch supervisor kill blocked: {killed.stderr}")
-            start = time.monotonic()
-            def relaunched_supervisor():
-                result = _run("/bin/launchctl", "print", gateway_service, check=False)
-                if result.returncode or "pid = " not in result.stdout:
-                    return False
-                new_pid = int(result.stdout.split("pid = ", 1)[1].splitlines()[0])
-                return new_pid != supervisor_pid and store.read()["generation"] > before_generation and service.health(port, .2)
-            _wait(relaunched_supervisor, timeout=15, message="new supervisor relaunch and state activity")
-            timings["supervisor_kill"] = time.monotonic() - start
-            state = store.read()
-            assert state["child"]["pid"] == old_child
-            assert service.listener_pids(port) == {old_child}
-
-            # Exact maintenance rehearsal: old supervisor, durable provenance,
-            # script replacement, supervisor-only kill, then guarded repair.
-            import http.client
-            keepalive = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
-            keepalive.connect()
-            keepalive.request("GET", "/api/health", headers={"Connection": "keep-alive"})
-            response = keepalive.getresponse()
-            assert response.status == 200 and json.loads(response.read())['ok'] is True
-            connection_socket = keepalive.sock
-            assert connection_socket is not None
-            connection_endpoint = connection_socket.getsockname()
-            original_script = bin_dir / "gateway_service.py"
-            patched_bytes = SOURCE.read_bytes()
-            baseline_bytes = subprocess.check_output([
-                "git", "-C", str(ROOT), "show",
-                "fac053ea2ec20dbfc44e519309eb4de86f86c7a9:scripts/service/gateway_service.py",
-            ])
-            service.atomic_write(original_script, baseline_bytes, original_script.stat().st_mode & 0o777)
-            old_supervisor_pid = service.loaded_job_pid(gateway_service)
-            assert old_supervisor_pid is not None
-            _run("/bin/kill", "-KILL", str(old_supervisor_pid))
-            _wait(lambda: service.loaded_job_pid(gateway_service) not in (None, old_supervisor_pid)
-                  and service.health(port, .2), timeout=15, message="old supervisor relaunch")
-            assert original_script.read_bytes() == baseline_bytes
-            old_child_record = store.read()["child"]
-            old_child_snapshot = service.process_snapshot(old_child_record["pid"])
-            assert old_child_record["pid"] == old_child
-            assert old_child_snapshot["ppid"] == service.loaded_job_pid(gateway_service) or old_child_snapshot["ppid"] > 1
-            maintenance = base / "ownership-maintenance.json"
-            maintenance.write_text(json.dumps({
-                "supervisor_pid": service.loaded_job_pid(gateway_service),
-                "child": old_child_record,
-                "child_snapshot": old_child_snapshot,
-                "listener": sorted(service.listener_pids(port)),
-            }, indent=2), encoding="utf-8")
-            original_interval = float(store.read()["config"]["health_interval"])
-            with store.locked() as locked:
-                if locked.get("child") != old_child_record or locked.get("transition") is not None:
-                    raise AssertionError("scratch maintenance state changed before record removal")
-                locked["config"]["health_interval"] = 60
-                locked["child"] = None
-                locked["phase"] = "degraded"
-                locked["diagnostic"] = "Scratch confirmed missing-child degraded state"
-            service.atomic_write(original_script, patched_bytes, original_script.stat().st_mode & 0o777)
-            assert original_script.read_bytes() == patched_bytes
-            successor_before = service.loaded_job_pid(gateway_service)
-            assert successor_before is not None
-            os.kill(successor_before, signal.SIGKILL)
-            start = time.monotonic()
-            _wait(lambda: service.loaded_job_pid(gateway_service) not in (None, successor_before),
-                  timeout=15, message="patched supervisor successor")
-            _wait(lambda: service.listener_pids(port) == {old_child} and service.health(port, .2),
-                  timeout=8, message="unchanged gateway listener after supervisor replacement")
-            state = store.read()
-            assert state["child"] is None
-            assert service.listener_pids(port) == {old_child}
-            with store.locked() as locked:
-                if locked.get("child") is not None or locked.get("transition") is not None:
-                    raise AssertionError("patched supervisor adopted unknown listener")
-                if locked.get("current") != state.get("current") or locked.get("qualified") != state.get("qualified"):
-                    raise AssertionError("release pointers changed during maintenance")
-                locked["child"] = old_child_record
-                locked["config"]["health_interval"] = original_interval
-                locked["phase"] = "degraded"
-                locked["diagnostic"] = "Scratch restored proved child ownership"
-            _wait(lambda: store.read().get("phase") == "healthy" and store.read().get("child") == old_child_record,
-                  timeout=15, message="patched retained-child recovery")
-            assert service.listener_pids(port) == {old_child}
-            assert service.health(port, .2)
-            assert keepalive.sock is connection_socket
-            assert keepalive.sock.getsockname() == connection_endpoint
-            keepalive.request("GET", "/api/health", headers={"Connection": "keep-alive"})
-            response = keepalive.getresponse()
-            assert response.status == 200 and json.loads(response.read())['ok'] is True
-            keepalive.close()
+            maintenance_rehearsal_checks(python, runtime_path)
 
             # A hung local health handler triggers bounded restart recovery.
             hung, _, _ = make_live_release(home / ".9router", "hang", "hang")
