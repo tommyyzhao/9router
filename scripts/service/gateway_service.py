@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -252,9 +253,12 @@ def process_snapshot(pid: int, ps: str = "/bin/ps", lsof: str = "/usr/sbin/lsof"
         raise ServiceError("Invalid child PID")
     line = _run_probe([ps, "-o", "pid=,ppid=,pgid=,sess=,lstart=", "-p", str(pid)]).strip()
     fields = line.split(None, 4)
-    if len(fields) != 5 or int(fields[0]) != pid:
-        raise ServiceError("Process identity disappeared")
-    ppid, pgid, session = map(int, fields[1:4])
+    try:
+        if len(fields) != 5 or int(fields[0]) != pid:
+            raise ServiceError("Process identity disappeared")
+        ppid, pgid, session = map(int, fields[1:4])
+    except (TypeError, ValueError) as error:
+        raise ServiceError("Malformed process identity probe") from error
     start = fields[4].strip()
     paths = _run_probe([lsof, "-a", "-p", str(pid), "-d", "cwd,txt", "-Fn"]).splitlines()
     cwd = None
@@ -277,10 +281,16 @@ def process_snapshot(pid: int, ps: str = "/bin/ps", lsof: str = "/usr/sbin/lsof"
 def process_group(ps: str, pgid: int) -> dict[int, tuple[int, int, int]]:
     output = _run_probe([ps, "-axo", "pid=,ppid=,pgid=,sess="])
     result: dict[int, tuple[int, int, int]] = {}
-    for line in output.splitlines():
-        fields = line.split()
-        if len(fields) == 4 and int(fields[2]) == pgid:
-            result[int(fields[0])] = (int(fields[1]), int(fields[2]), int(fields[3]))
+    try:
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) != 4:
+                raise ServiceError("Malformed process-group probe")
+            pid, ppid, member_pgid, session = map(int, fields)
+            if member_pgid == pgid:
+                result[pid] = (ppid, member_pgid, session)
+    except (TypeError, ValueError) as error:
+        raise ServiceError("Malformed process-group probe") from error
     return result
 
 
@@ -435,19 +445,72 @@ def wait_ready(record: dict[str, Any], deadline_seconds: float, successes: int =
     return False
 
 
+def _reap_direct_child(pid: int) -> bool:
+    if type(pid) is not int or pid <= 1:
+        raise ServiceError("Invalid child PID")
+    try:
+        waited, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return False
+    except OSError as error:
+        if error.errno == errno.ECHILD:
+            return False
+        raise ServiceError(f"Cannot inspect child process {pid}: {error}") from error
+    return waited == pid
+
+
+def _pid_absent(pid: int) -> bool:
+    if _reap_direct_child(pid):
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError as error:
+        raise ServiceError(f"Cannot prove process {pid} is gone: {error}") from error
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return True
+        raise ServiceError(f"Cannot prove process {pid} is gone: {error}") from error
+    return False
+
+
+def _confirmed_record_gone(record: dict[str, Any]) -> bool:
+    if not _pid_absent(record["pid"]):
+        return False
+    try:
+        members = process_group("/bin/ps", record["pgid"])
+        listeners = listener_pids(record["port"])
+    except (KeyError, ServiceError, TypeError, ValueError):
+        return False
+    return not members and not listeners
+
+
 def wait_gone(record: dict[str, Any], timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            process_snapshot(record["pid"])
-        except ServiceError:
+        if _confirmed_record_gone(record):
             return True
+        try:
+            snapshot = process_snapshot(record["pid"])
+        except ServiceError:
+            # A failed identity probe is not proof of death; keep waiting until
+            # native liveness proves absence or the bounded stop window expires.
+            time.sleep(.1)
+            continue
+        if snapshot["start"] != record["start"]:
+            raise ServiceError("Child identity changed while stopping")
         time.sleep(.1)
     return False
 
 
 def stop_child(record: dict[str, Any], graceful: float = 10.0) -> None:
-    signal_child(record, signal.SIGTERM, require_listener=False)
+    try:
+        signal_child(record, signal.SIGTERM, require_listener=False)
+    except ServiceError as error:
+        if _confirmed_record_gone(record):
+            return
+        raise error
     if wait_gone(record, graceful):
         return
     signal_child(record, signal.SIGKILL, require_listener=False)
@@ -472,6 +535,29 @@ def _runtime_release(state: dict[str, Any], key: str) -> dict[str, Any]:
     return releases[key]
 
 
+def recover_retained_child(store: StateStore, config: dict[str, Any], record: dict[str, Any]) -> bool:
+    state = store.read()
+    if state.get("phase") != "degraded" or state.get("transition") is not None:
+        return False
+    if state.get("child") != record:
+        raise ServiceError("Retained child changed before recovery")
+    release = _runtime_release(state, state["current"])
+    if record.get("release") != release.get("path") or record.get("release_digest") != release.get("digest"):
+        raise ServiceError("Retained child release no longer matches current release")
+    if not wait_ready(record, float(config["startup_timeout"])):
+        return False
+    with store.locked() as locked:
+        if (locked.get("phase") != "degraded" or locked.get("child") != record
+                or locked.get("transition") is not None):
+            raise ServiceError("Retained child changed during recovery")
+        current = _runtime_release(locked, locked["current"])
+        if record.get("release") != current.get("path") or record.get("release_digest") != current.get("digest"):
+            raise ServiceError("Current release changed during child recovery")
+        locked["phase"] = "healthy"
+        _diagnostic(locked, f"Recovered retained child: {locked['current']}")
+    return True
+
+
 def reconcile_record(store: StateStore, port: int) -> dict[str, Any] | None:
     state = store.read()
     record = state.get("child")
@@ -489,14 +575,13 @@ def reconcile_record(store: StateStore, port: int) -> dict[str, Any] | None:
         # to clear; stale/reused PID or unknown listener remains degraded.
         if listeners:
             raise ServiceError(f"Ambiguous recorded child/listener: {error}") from error
-        try:
-            process_snapshot(record.get("pid"))
-        except ServiceError:
-            with store.locked() as locked:
-                if locked.get("child") == record:
-                    locked["child"] = None
-            return None
-        raise ServiceError(f"Ambiguous live recorded child: {error}") from error
+        pid = record.get("pid")
+        if type(pid) is not int or pid <= 1 or not _confirmed_record_gone(record):
+            raise ServiceError(f"Ambiguous live recorded child: {error}") from error
+        with store.locked() as locked:
+            if locked.get("child") == record:
+                locked["child"] = None
+        return None
     return record
 
 
@@ -557,6 +642,8 @@ def rollback(store: StateStore, config: dict[str, Any], reason: str) -> dict[str
     if current is not None:
         stop_child(current)
         with store.locked() as locked:
+            if locked.get("child") != current:
+                raise ServiceError("Child ownership changed while rolling back")
             locked["child"] = None
     with store.locked() as locked:
         locked["phase"] = "rollback-starting"
@@ -566,9 +653,16 @@ def rollback(store: StateStore, config: dict[str, Any], reason: str) -> dict[str
     baseline = _runtime_release(store.read(), target_name)
     record = start_selected(store, baseline, config, "rollback-starting")
     if not wait_ready(record, float(config["startup_timeout"])):
-        with contextlib.suppress(ServiceError):
+        try:
             stop_child(record)
+        except ServiceError as error:
+            with store.locked() as locked:
+                locked["phase"] = "degraded"
+                _record_failure(locked, f"Qualified rollback release failed readiness; stop failed: {error}")
+            return None
         with store.locked() as locked:
+            if locked.get("child") != record:
+                raise ServiceError("Child ownership changed after rollback readiness failure")
             locked["child"] = None
             locked["phase"] = "degraded"
             _record_failure(locked, "Qualified rollback release failed readiness")
@@ -662,6 +756,11 @@ def monitor(store: StateStore, config: dict[str, Any], record: dict[str, Any]) -
             alive = health(int(config["port"]))
         except ServiceError:
             alive = False
+        if alive:
+            latest = store.read()
+            if (latest.get("phase") == "degraded" and latest.get("child") == record
+                    and latest.get("transition") is None):
+                return
         failures = 0 if alive else failures + 1
         if failures < int(config["health_failures"]):
             continue
@@ -678,17 +777,33 @@ def monitor(store: StateStore, config: dict[str, Any], record: dict[str, Any]) -
                                                 "target": locked["current"], "id": "crash-loop"}
                 rollback(store, config, "Crash-loop budget exhausted")
                 return
-            with contextlib.suppress(ServiceError):
+            try:
                 stop_child(record)
+            except ServiceError as error:
+                with store.locked() as locked:
+                    locked["phase"] = "degraded"
+                    _diagnostic(locked, f"Qualified fallback crash-loop exhausted; stop failed: {error}")
+                time.sleep(float(config["degraded_interval"]))
+                return
             with store.locked() as locked:
+                if locked.get("child") != record:
+                    raise ServiceError("Child ownership changed after crash-loop stop")
                 locked["child"] = None
                 locked["phase"] = "degraded"
                 _diagnostic(locked, "Qualified fallback crash-loop exhausted; slow restart")
             time.sleep(float(config["degraded_interval"]))
             return
-        with contextlib.suppress(ServiceError):
+        try:
             stop_child(record)
+        except ServiceError as error:
+            with store.locked() as state:
+                state["phase"] = "degraded"
+                _diagnostic(state, f"Child restart stop failed: {error}")
+            time.sleep(float(config["degraded_interval"]))
+            return
         with store.locked() as state:
+            if state.get("child") != record:
+                raise ServiceError("Child ownership changed during restart")
             state["child"] = None
             state["phase"] = "restarting"
         time.sleep(min(2 ** max(0, count - 1), float(config["max_backoff"])))
@@ -703,14 +818,27 @@ def supervise(service_dir: Path) -> None:
             try:
                 config = store.read()["config"]
                 record = apply_transition(store, config)
+                if record is not None and recover_retained_child(store, config, record):
+                    continue
                 if record is None:
                     state = store.read()
                     release = _runtime_release(state, state["current"])
                     record = start_selected(store, release, config, "starting")
                     if not wait_ready(record, float(config["startup_timeout"])):
-                        with contextlib.suppress(ServiceError):
+                        try:
                             stop_child(record)
+                        except ServiceError as error:
+                            with store.locked() as locked:
+                                count = _record_failure(locked, f"Current release failed startup; stop failed: {error}")
+                                locked["phase"] = "degraded"
+                            if count >= int(config["failure_budget"]):
+                                time.sleep(float(config["degraded_interval"]))
+                            else:
+                                time.sleep(min(2 ** (count - 1), float(config["max_backoff"])))
+                            continue
                         with store.locked() as locked:
+                            if locked.get("child") != record:
+                                raise ServiceError("Child ownership changed after startup readiness failure")
                             locked["child"] = None
                             count = _record_failure(locked, "Current release failed startup")
                             locked["phase"] = "degraded" if count >= int(config["failure_budget"]) else "restarting"
