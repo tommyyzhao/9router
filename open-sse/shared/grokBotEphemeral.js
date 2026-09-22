@@ -44,6 +44,17 @@ export function sandHeaders(accessToken, machineId, options = {}) {
   });
 }
 
+async function readResponseBuffer(res) {
+  // proxyFetch MITM bypass returns a shim with text()/json() but no arrayBuffer().
+  if (typeof res.arrayBuffer === "function") {
+    return Buffer.from(await res.arrayBuffer());
+  }
+  if (typeof res.text === "function") {
+    return Buffer.from(await res.text(), "utf8");
+  }
+  throw new Error("response has neither arrayBuffer nor text");
+}
+
 async function postProto(base, headers, rpcPath, body, signal) {
   const h = { ...headers, "content-type": "application/proto" };
   const res = await fetch(`${base}${rpcPath}`, {
@@ -52,7 +63,7 @@ async function postProto(base, headers, rpcPath, body, signal) {
     body,
     signal,
   });
-  const buf = Buffer.from(await res.arrayBuffer());
+  const buf = await readResponseBuffer(res);
   return { status: res.status, ok: res.ok, buf, text: buf.toString("utf8") };
 }
 
