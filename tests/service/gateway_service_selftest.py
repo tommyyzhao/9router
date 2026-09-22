@@ -88,6 +88,23 @@ def make_live_release(base: Path, name: str, behavior: str = "healthy") -> tuple
 
 
 def offline_checks():
+    # Focused old-code regression: probe failure was misread as confirmed death.
+    with tempfile.TemporaryDirectory() as raw:
+        baseline_source = Path(raw) / "gateway_service_baseline.py"
+        baseline_source.write_bytes(subprocess.check_output([
+            "git", "-C", str(ROOT), "show",
+            "fac053ea2ec20dbfc44e519309eb4de86f86c7a9:scripts/service/gateway_service.py",
+        ]))
+        baseline_spec = importlib.util.spec_from_file_location("gateway_service_baseline", baseline_source)
+        baseline = importlib.util.module_from_spec(baseline_spec)
+        assert baseline_spec.loader is not None
+        baseline_spec.loader.exec_module(baseline)
+        with patch.object(baseline, "process_snapshot", side_effect=baseline.ServiceError("probe denied")):
+            assert baseline.wait_gone({"pid": 42}, .01) is True
+        with patch.object(service, "_pid_absent", return_value=False), \
+             patch.object(service, "process_snapshot", side_effect=service.ServiceError("probe denied")):
+            assert service.wait_gone({"pid": 42, "start": "start"}, .01) is False
+
     with tempfile.TemporaryDirectory() as raw:
         base = Path(raw)
         release, node, env = make_release(base)
@@ -222,6 +239,34 @@ def offline_checks():
         "arguments = {\n  /usr/bin/python-wrapper\n  --supervisor-helper\n}\n", "")
     with patch.object(service, "launchctl", return_value=fake_print):
         assert service.loaded_job_matches("gui/501/test", ["/usr/bin/python", "--supervisor"]) is False
+
+    # Readiness-stop failures preserve the underlying stop cause.
+    for rollback_path in (False, True):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            release, node, env = make_release(base, "baseline")
+            record = {"pid": 42, "start": "start"}
+            release_record = service.validate_release(release, base / "releases", node, env,
+                                                      service.fingerprint_schema(release))
+            store = service.StateStore(base / "state.json")
+            store.create({"phase": "rollback-starting", "current": "candidate", "qualified": "candidate",
+                          "last_good": "baseline", "transition": {"rollback": "baseline"}, "child": record,
+                          "releases": {"baseline": release_record}, "config": {"port": _free_port(),
+                          "startup_timeout": 1, "releases_dir": str(base / "releases"), "hostname": "127.0.0.1",
+                          "data_dir": str(base), "home": str(base), "child_log": str(base / "child.log")}})
+            if rollback_path:
+                with patch.object(service, "reconcile_record", return_value=None), \
+                     patch.object(service, "start_selected", return_value=record), \
+                     patch.object(service, "wait_ready", return_value=False), \
+                     patch.object(service, "stop_child", side_effect=service.ServiceError("stop denied")):
+                    service.rollback(store, store.read()["config"], "rollback test")
+            else:
+                with patch.object(service, "reconcile_record", return_value=None), \
+                     patch.object(service, "start_selected", return_value=record), \
+                     patch.object(service, "wait_ready", return_value=False), \
+                     patch.object(service, "stop_child", side_effect=service.ServiceError("stop denied")):
+                    service.rollback(store, store.read()["config"], "startup test")
+            assert "stop denied" in store.read()["diagnostic"]
 
     # Stop failure retains durable child ownership in restart and budget paths.
     stop_failure = service.ServiceError("stop denied")
