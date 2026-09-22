@@ -1,0 +1,10 @@
+{
+  "password": "fixture-test-password!!",
+  "expected": {
+    "accessToken": "fixture-access-token-not-real-abcdefghijklmnopqrstuvwxyz0123456789",
+    "refreshToken": "fixture-refresh-token-not-real-abcdefghijklmnopqrstuvwxyz0123456789",
+    "machineId": "00000000-1111-2222-3333-444444444444",
+    "email": "fixture@example.com",
+    "name": "Fixture User"
+  }
+}

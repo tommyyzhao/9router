@@ -90,9 +90,16 @@ export function generateCursorChecksum(machineId) {
  * @param {string} accessToken - Bearer token
  * @param {string} machineId - Machine ID (or will be generated from token)
  * @param {boolean} ghostMode - Enable ghost mode (privacy)
+ * @param {{
+ *   clientType?: string,
+ *   clientSource?: string|null,
+ *   clientVersion?: string,
+ *   clientCommit?: string,
+ *   includeChecksum?: boolean,
+ * }} [options] - Optional overrides (e.g. Grok Bot Desktop: clientType sand)
  * @returns {Object} - Headers object
  */
-export function buildCursorHeaders(accessToken, machineId = null, ghostMode = true) {
+export function buildCursorHeaders(accessToken, machineId = null, ghostMode = true, options = {}) {
   // Clean token if it has prefix
   const cleanToken = accessToken.includes("::")
     ? accessToken.split("::")[1]
@@ -119,7 +126,12 @@ export function buildCursorHeaders(accessToken, machineId = null, ghostMode = tr
     if (process.arch === "arm64") arch = "aarch64";
   }
 
-  return {
+  const clientType = options.clientType || "ide";
+  const clientVersion = options.clientVersion || (clientType === "sand" ? "sand-desktop" : "3.12.17");
+  const clientCommit = options.clientCommit || "0fb762053c34788bb7760d5673f8a6d4c8589d50";
+  const includeChecksum = options.includeChecksum !== false;
+
+  const headers = {
     "authorization": `Bearer ${cleanToken}`,
     "connect-accept-encoding": "gzip",
     "connect-protocol-version": "1",
@@ -127,10 +139,9 @@ export function buildCursorHeaders(accessToken, machineId = null, ghostMode = tr
     "user-agent": "connect-es/1.6.1",
     "x-amzn-trace-id": `Root=${crypto.randomUUID()}`,
     "x-client-key": clientKey,
-    "x-cursor-checksum": checksum,
-    "x-cursor-client-version": "3.12.17",
-    "x-cursor-client-commit": "0fb762053c34788bb7760d5673f8a6d4c8589d50",
-    "x-cursor-client-type": "ide",
+    "x-cursor-client-version": clientVersion,
+    "x-cursor-client-commit": clientCommit,
+    "x-cursor-client-type": clientType,
     "x-cursor-client-os": os,
     "x-cursor-client-arch": arch,
     "x-cursor-client-device-type": "desktop",
@@ -140,6 +151,15 @@ export function buildCursorHeaders(accessToken, machineId = null, ghostMode = tr
     "x-request-id": crypto.randomUUID(),
     "x-session-id": sessionId
   };
+
+  if (includeChecksum) {
+    headers["x-cursor-checksum"] = checksum;
+  }
+  if (options.clientSource) {
+    headers["x-cursor-client-source"] = options.clientSource;
+  }
+
+  return headers;
 }
 
 export default {
