@@ -6,7 +6,7 @@
 import crypto from "node:crypto";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
 import { flattenMessagesToEnvelope } from "./grokBotEnvelope.js";
-import { parseAssistantCompletion } from "./grokBotTools.js";
+import { parseAssistantCompletion, extractJsonObjectWithKey } from "./grokBotTools.js";
 
 const DEFAULT_BASE = "https://api2.cursor.sh";
 
@@ -153,39 +153,11 @@ export function extractAssistantTextFromList(rawText) {
   if (!rawText) return null;
   const raw = String(rawText);
 
-  // Prefer an embedded tool_calls JSON object (long write args often break content-regex).
-  const marker = '"tool_calls"';
-  let searchFrom = 0;
-  let lastToolJson = null;
-  while (true) {
-    const mi = raw.indexOf(marker, searchFrom);
-    if (mi < 0) break;
-    const start = raw.lastIndexOf("{", mi);
-    if (start >= 0) {
-      let depth = 0;
-      for (let j = start; j < raw.length; j++) {
-        const ch = raw[j];
-        if (ch === "{") depth++;
-        else if (ch === "}") {
-          depth--;
-          if (depth === 0) {
-            const slice = raw.slice(start, j + 1);
-            try {
-              const obj = JSON.parse(slice);
-              if (obj && Array.isArray(obj.tool_calls) && obj.tool_calls.length) {
-                lastToolJson = slice;
-              }
-            } catch {
-              /* keep scanning */
-            }
-            break;
-          }
-        }
-      }
-    }
-    searchFrom = mi + marker.length;
+  // Prefer embedded tool_calls JSON (string-aware — HTML/CSS braces in args are fine).
+  const toolObj = extractJsonObjectWithKey(raw, "tool_calls");
+  if (toolObj && Array.isArray(toolObj.tool_calls) && toolObj.tool_calls.length) {
+    return JSON.stringify(toolObj);
   }
-  if (lastToolJson) return lastToolJson;
 
   // Prefer send-message kind
   const re = /"kind":"send-message"[\s\S]*?"content":"((?:\\.|[^"\\])*)"/g;

@@ -42,63 +42,73 @@ export function toolProtocolText() {
  * Strip optional markdown fences, then try to parse tool_calls JSON.
  * @returns {{ kind: 'tool_calls', toolCalls: Array } | { kind: 'text', text: string }}
  */
-export function parseAssistantCompletion(raw) {
-  let text = String(raw ?? "").trim();
-  if (!text) return { kind: "text", text: "" };
 
-  // Unescape common transcript artifacts (double-encoded quotes / newlines)
-  if (text.includes('\\"') && text.includes("tool_calls")) {
-    try {
-      const once = JSON.parse(`"${text.replace(/^"|"$/g, (m, i, s) => (i === 0 || i === s.length - 1 ? "" : m))}"`);
-      if (typeof once === "string" && once.includes("tool_calls")) text = once.trim();
-    } catch {
-      /* keep text */
+/**
+ * Find the last JSON object in `text` that contains key `key` (e.g. "tool_calls"),
+ * respecting strings so braces inside HTML/CSS arguments do not truncate the object.
+ * @returns {object|null}
+ */
+export function extractJsonObjectWithKey(text, key) {
+  const s = String(text ?? "");
+  const marker = `"${key}"`;
+  let searchFrom = 0;
+  let lastObj = null;
+
+  while (true) {
+    const mi = s.indexOf(marker, searchFrom);
+    if (mi < 0) break;
+    const start = s.lastIndexOf("{", mi);
+    if (start < 0) {
+      searchFrom = mi + marker.length;
+      continue;
     }
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let j = start; j < s.length; j++) {
+      const ch = s[j];
+      if (inString) {
+        if (escape) escape = false;
+        else if (ch === "\\\\") escape = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          const slice = s.slice(start, j + 1);
+          try {
+            const obj = JSON.parse(slice);
+            if (obj && Object.prototype.hasOwnProperty.call(obj, key)) lastObj = obj;
+          } catch {
+            /* keep scanning */
+          }
+          break;
+        }
+      }
+    }
+    searchFrom = mi + marker.length;
   }
+  return lastObj;
+}
+
+export function parseAssistantCompletion(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return { kind: "text", text: "" };
 
   let candidate = text;
   const fence = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) candidate = fence[1].trim();
 
-  const tryParse = (s) => {
-    try {
-      return JSON.parse(s);
-    } catch {
-      return null;
-    }
-  };
+  const obj =
+    extractJsonObjectWithKey(candidate, "tool_calls") ||
+    extractJsonObjectWithKey(text, "tool_calls");
 
-  const extractToolCallsObj = (s) => {
-    let obj = tryParse(s);
-    if (obj && Array.isArray(obj.tool_calls)) return obj;
-    // Search for tool_calls key (with optional whitespace)
-    const markers = ['"tool_calls"', "'tool_calls'"];
-    let idx = -1;
-    for (const m of markers) {
-      const i = s.indexOf(m);
-      if (i >= 0) {
-        // walk back to opening brace
-        let start = s.lastIndexOf("{", i);
-        if (start < 0) continue;
-        let depth = 0;
-        for (let j = start; j < s.length; j++) {
-          if (s[j] === "{") depth++;
-          else if (s[j] === "}") {
-            depth--;
-            if (depth === 0) {
-              obj = tryParse(s.slice(start, j + 1));
-              if (obj && Array.isArray(obj.tool_calls)) return obj;
-              break;
-            }
-          }
-        }
-        idx = i;
-      }
-    }
-    return null;
-  };
-
-  const obj = extractToolCallsObj(candidate) || extractToolCallsObj(text);
   if (obj && Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0) {
     const toolCalls = obj.tool_calls.map((tc, i) => normalizeToolCall(tc, i)).filter(Boolean);
     if (toolCalls.length) return { kind: "tool_calls", toolCalls };
