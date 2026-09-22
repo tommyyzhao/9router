@@ -7,10 +7,12 @@ Default mode is offline and cannot call launchctl.  Real launchd tests require
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -50,11 +52,37 @@ def make_release(base: Path, name="release") -> tuple[Path, Path, Path]:
     (release / ".next/BUILD_ID").write_text(name, encoding="utf-8")
     (release / "src/lib/db/migrations/001.js").write_text("schema", encoding="utf-8")
     node = base / "node"
-    node.write_text("#!/bin/sh\n", encoding="utf-8")
-    node.chmod(0o700)
+    if not node.exists():
+        node.write_text("#!/bin/sh\n", encoding="utf-8")
+        node.chmod(0o700)
     env = base / "stable.env"
-    env.write_text("SECRET=not-printed\n", encoding="utf-8")
+    if not env.exists():
+        env.write_text("SECRET=not-printed\n", encoding="utf-8")
     return release, node, env
+
+
+def make_live_release(base: Path, name: str, behavior: str = "healthy") -> tuple[Path, Path, Path]:
+    release, _, env = make_release(base, name)
+    script = release / "custom-server.js"
+    script.write_text(
+        "const http=require('http');\n"
+        "process.title='next-server (scratch)';\n"
+        "const port=Number(process.env.PORT);\n"
+        f"const behavior={json.dumps(behavior)};\n"
+        "if(behavior==='prebind') process.exit(42);\n"
+        "const server=http.createServer((req,res)=>{\n"
+        " if(behavior==='hang') return;\n"
+        " res.writeHead(200,{'content-type':'application/json'});res.end('{\\\"ok\\\":true}');\n"
+        "});\n"
+        "server.listen(port,'127.0.0.1',()=>{\n"
+        " if(behavior==='crash') setTimeout(()=>process.exit(43),1000);\n"
+        "});\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    node = Path("/opt/homebrew/Cellar/node/26.0.0/bin/node")
+    assert node.is_file(), f"scratch tests require pinned Node: {node}"
+    return release, node.resolve(), env
 
 
 def offline_checks():
@@ -184,14 +212,211 @@ def _free_port():
     return port
 
 
+def _wait(predicate, timeout=15, interval=.1, message="condition"):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(interval)
+    raise AssertionError(f"Timed out waiting for {message}")
+
+
+def _run(*args, timeout=20, check=True):
+    result = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, timeout=timeout)
+    if check and result.returncode:
+        raise AssertionError(f"command failed {args}: {result.returncode}: {result.stderr}")
+    return result
+
+
+def _bootout(service_name):
+    _run("/bin/launchctl", "bootout", service_name, check=False)
+    _wait(lambda: _run("/bin/launchctl", "print", service_name, check=False).returncode != 0,
+          timeout=10, message=f"bootout {service_name}")
+
+
+def real_launchd_checks():
+    assert sys.platform == "darwin", "real launchd tests require macOS"
+    assert os.environ.get("GATEWAY_SELFTEST_REAL") == "1", "set GATEWAY_SELFTEST_REAL=1"
+    uid = os.getuid()
+    suffix = f"{uid}.{os.getpid()}.{int(time.time())}"
+    label = f"io.9router.selftest.gateway.{suffix}"
+    guard_label = f"{label}.guard"
+    domain = f"gui/{uid}"
+    gateway_service = f"{domain}/{label}"
+    guard_service = f"{domain}/{guard_label}"
+    port = _free_port()
+    timings = {}
+    with tempfile.TemporaryDirectory(prefix="9router-launchd-selftest-") as raw:
+        base = Path(raw).resolve()
+        home = base / "home"
+        service_dir = home / ".9router/service"
+        bin_dir = home / ".9router/bin"
+        releases_dir = home / ".9router/releases"
+        launch_agents = home / "Library/LaunchAgents"
+        logs = home / ".9router/logs"
+        data = home / ".9router/data"
+        for directory in (home, data):
+            directory.mkdir(parents=True, mode=0o700)
+        healthy, node, env = make_live_release(home / ".9router", "healthy")
+        env.write_text("SCRATCH_ONLY=1\n", encoding="utf-8")
+        schema_source = healthy
+        python = Path(sys.executable).resolve()
+        install_args = [
+            str(RELEASE_SOURCE), "install", "--baseline", str(healthy), "--python", str(python),
+            "--node", str(node), "--env-file", str(env), "--schema-source", str(schema_source),
+            "--service-dir", str(service_dir), "--bin-dir", str(bin_dir),
+            "--releases-dir", str(releases_dir), "--launch-agents", str(launch_agents),
+            "--log-dir", str(logs), "--home", str(home), "--data-dir", str(data),
+            "--label", label, "--guard-label", guard_label, "--port", str(port),
+            "--hostname", "127.0.0.1", "--startup-timeout", "8", "--probation", "2",
+            "--health-interval", ".25", "--health-failures", "2", "--failure-budget", "3",
+            "--max-backoff", "1", "--degraded-interval", "2", "--guard-interval", ".5",
+            "--bootstrap-attempts", "2",
+        ]
+        _run(str(python), *install_args)
+        store = service.StateStore(service_dir / "state.json")
+        gateway_plist = launch_agents / f"{label}.plist"
+        guard_plist = launch_agents / f"{guard_label}.plist"
+        fallback = base / "fallback.plist"
+        fallback.write_bytes(gateway_plist.read_bytes())
+        _run(str(python), str(RELEASE_SOURCE), "arm-install", "--service-dir", str(service_dir),
+             "--original-plist", str(fallback))
+        jobs = [guard_service, gateway_service]
+        try:
+            start = time.monotonic()
+            _run("/bin/launchctl", "bootstrap", domain, str(guard_plist))
+            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed" and service.health(port, .2),
+                  timeout=15, message="guard-owned initial migration")
+            timings["initial_migration"] = time.monotonic() - start
+            state = store.read()
+            assert state["install_transaction"]["phase"] == "committed", state
+            assert state["install_transaction"]["loaded"] == "stable", state
+            assert _run("/bin/launchctl", "print", gateway_service, check=False).returncode == 0
+
+            # Missing-job recovery is autonomous; no command starts gateway after bootout.
+            start = time.monotonic()
+            _bootout(gateway_service)
+            _wait(lambda: _run("/bin/launchctl", "print", gateway_service, check=False).returncode == 0 and service.health(port, .2),
+                  timeout=15, message="missing-job recovery")
+            timings["missing_job"] = time.monotonic() - start
+
+            # Supervisor SIGKILL: launchd restarts supervisor; recorded owned child
+            # is reconciled without a second listener or orphan.
+            state = store.read()
+            old_child = state["child"]["pid"]
+            supervisor_pid = int(_run("/bin/launchctl", "print", gateway_service).stdout.split("pid = ", 1)[1].splitlines()[0])
+            killed = _run("/bin/launchctl", "kill", "SIGKILL", gateway_service, check=False)
+            if killed.returncode:
+                raise AssertionError(f"scratch supervisor kill blocked: {killed.stderr}")
+            start = time.monotonic()
+            _wait(lambda: _run("/bin/launchctl", "print", gateway_service, check=False).returncode == 0 and service.health(port, .2),
+                  timeout=15, message="supervisor relaunch")
+            timings["supervisor_kill"] = time.monotonic() - start
+            state = store.read()
+            assert state["child"]["pid"] == old_child
+            assert service.listener_pids(port) == {old_child}
+
+            # Candidate prebind failure rolls back to the qualified release.
+            broken, _, _ = make_live_release(home / ".9router", "prebind", "prebind")
+            schema = state["releases"][state["qualified"]]["schema_digest"]
+            broken_record = service.validate_release(broken, releases_dir, node, env, schema)
+            with store.locked() as locked:
+                locked["releases"]["prebind"] = broken_record
+                locked["transition"] = {"id": "prebind", "phase": "queued", "target": "prebind",
+                                        "rollback": locked["qualified"], "queued_at": time.time()}
+                locked["phase"] = "transition-queued"
+            start = time.monotonic()
+            _wait(lambda: store.read().get("transition") is None and store.read().get("phase") == "healthy",
+                  timeout=20, message="prebind rollback")
+            timings["prebind_rollback"] = time.monotonic() - start
+            assert store.read()["current"] == "healthy"
+            assert service.health(port, .2)
+
+            # Post-ready crash fails probation and rolls back.
+            crash, _, _ = make_live_release(home / ".9router", "crash", "crash")
+            crash_record = service.validate_release(crash, releases_dir, node, env, schema)
+            with store.locked() as locked:
+                locked["releases"]["crash"] = crash_record
+                locked["transition"] = {"id": "crash", "phase": "queued", "target": "crash",
+                                        "rollback": locked["qualified"], "queued_at": time.time()}
+                locked["phase"] = "transition-queued"
+            start = time.monotonic()
+            _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "healthy",
+                  timeout=20, message="post-ready crash rollback")
+            timings["crash_rollback"] = time.monotonic() - start
+            assert service.health(port, .2)
+
+            # Occupied unknown listener is diagnosed; never killed.
+            _bootout(gateway_service)
+            state = store.read()
+            if state.get("child"):
+                with contextlib.suppress(Exception):
+                    service.stop_child(state["child"], graceful=1)
+                with store.locked() as locked:
+                    locked["child"] = None
+            stranger = subprocess.Popen([sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+                                         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                _wait(lambda: stranger.pid in service.listener_pids(port), timeout=5, message="unknown listener")
+                _run("/bin/launchctl", "bootstrap", domain, str(gateway_plist), check=False)
+                _wait(lambda: store.read().get("phase") == "degraded", timeout=8, message="unknown-listener degraded")
+                assert stranger.poll() is None
+                assert "Unknown process" in store.read().get("diagnostic", "")
+            finally:
+                _bootout(gateway_service)
+                os.killpg(stranger.pid, signal.SIGTERM)
+                stranger.wait(timeout=3)
+
+            # Reproduce original incident shape: invalid stable plist plus fallback.
+            bad_stable = service_dir / "bad-stable.plist"
+            bad_stable.write_text("not a plist", encoding="utf-8")
+            with store.locked() as locked:
+                locked["guard"]["stable_plist"] = str(bad_stable)
+                locked["install_transaction"] = {
+                    "phase": "armed", "stable_plist": str(bad_stable),
+                    "fallback_plist": str(fallback), "armed_at": time.time(),
+                }
+                locked["phase"] = "install-armed"
+            start = time.monotonic()
+            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed" and service.health(port, .2),
+                  timeout=20, message="bootstrap rejection fallback")
+            state = store.read()
+            timings["bootstrap_rejection_fallback"] = time.monotonic() - start
+            assert state["install_transaction"]["phase"] == "committed", state
+            assert state["install_transaction"]["loaded"] == "fallback", state
+        except BaseException:
+            print("SCRATCH DEBUG", base, "port", port, file=sys.stderr)
+            with contextlib.suppress(Exception):
+                print("STATE", json.dumps(store.read(), indent=2), file=sys.stderr)
+            for diagnostic in (logs / "guard.err", logs / "guard.log", logs / "supervisor.err", logs / "supervisor.log", logs / "gateway-child.log"):
+                if diagnostic.exists():
+                    print(diagnostic.name, diagnostic.read_text(errors="replace")[-4000:], file=sys.stderr)
+            raise
+        finally:
+            for job in jobs:
+                _bootout(job)
+            with contextlib.suppress(Exception):
+                record = store.read().get("child")
+                if record:
+                    service.stop_child(record, graceful=1)
+            _wait(lambda: not service.listener_pids(port), timeout=5, message="scratch listener cleanup")
+            listeners = service.listener_pids(port)
+            assert not listeners, f"scratch listener leaked: {listeners}"
+            assert _run("/bin/launchctl", "print", gateway_service, check=False).returncode != 0
+            assert _run("/bin/launchctl", "print", guard_service, check=False).returncode != 0
+    print("PASS real launchd:", json.dumps({name: round(value, 3) for name, value in timings.items()}, sort_keys=True))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--real-launchd", action="store_true")
     args = parser.parse_args()
     offline_checks()
-    if args.real_launchd:
-        raise AssertionError("real launchd checks not implemented yet")
     print("PASS offline: atomic state/locks, release/schema/env binding, symlink rejection, identity/title/PID/group/listener checks")
+    if args.real_launchd:
+        real_launchd_checks()
 
 
 if __name__ == "__main__":

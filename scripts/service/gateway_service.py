@@ -490,7 +490,7 @@ def start_selected(store: StateStore, release: dict[str, Any], config: dict[str,
     try:
         record = capture_child_identity(process.pid, release, port)
     except BaseException:
-        with contextlib.suppress(ProcessLookupError):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(process.pid, signal.SIGKILL)
         raise
     with store.locked() as state:
