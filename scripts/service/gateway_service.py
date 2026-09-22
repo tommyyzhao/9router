@@ -446,6 +446,8 @@ def wait_ready(record: dict[str, Any], deadline_seconds: float, successes: int =
 
 
 def _reap_direct_child(pid: int) -> bool:
+    if type(pid) is not int or pid <= 1:
+        raise ServiceError("Invalid child PID")
     try:
         waited, _ = os.waitpid(pid, os.WNOHANG)
     except ChildProcessError:
@@ -473,10 +475,21 @@ def _pid_absent(pid: int) -> bool:
     return False
 
 
+def _confirmed_record_gone(record: dict[str, Any]) -> bool:
+    if not _pid_absent(record["pid"]):
+        return False
+    try:
+        members = process_group("/bin/ps", record["pgid"])
+        listeners = listener_pids(record["port"])
+    except (KeyError, ServiceError, TypeError, ValueError):
+        return False
+    return not members and not listeners
+
+
 def wait_gone(record: dict[str, Any], timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if _pid_absent(record["pid"]):
+        if _confirmed_record_gone(record):
             return True
         try:
             snapshot = process_snapshot(record["pid"])
@@ -492,7 +505,12 @@ def wait_gone(record: dict[str, Any], timeout: float) -> bool:
 
 
 def stop_child(record: dict[str, Any], graceful: float = 10.0) -> None:
-    signal_child(record, signal.SIGTERM, require_listener=False)
+    try:
+        signal_child(record, signal.SIGTERM, require_listener=False)
+    except ServiceError as error:
+        if _confirmed_record_gone(record):
+            return
+        raise error
     if wait_gone(record, graceful):
         return
     signal_child(record, signal.SIGKILL, require_listener=False)
@@ -529,7 +547,8 @@ def recover_retained_child(store: StateStore, config: dict[str, Any], record: di
     if not wait_ready(record, float(config["startup_timeout"])):
         return False
     with store.locked() as locked:
-        if locked.get("child") != record or locked.get("transition") is not None:
+        if (locked.get("phase") != "degraded" or locked.get("child") != record
+                or locked.get("transition") is not None):
             raise ServiceError("Retained child changed during recovery")
         current = _runtime_release(locked, locked["current"])
         if record.get("release") != current.get("path") or record.get("release_digest") != current.get("digest"):
@@ -557,7 +576,7 @@ def reconcile_record(store: StateStore, port: int) -> dict[str, Any] | None:
         if listeners:
             raise ServiceError(f"Ambiguous recorded child/listener: {error}") from error
         pid = record.get("pid")
-        if not isinstance(pid, int) or not _pid_absent(pid):
+        if type(pid) is not int or pid <= 1 or not _confirmed_record_gone(record):
             raise ServiceError(f"Ambiguous live recorded child: {error}") from error
         with store.locked() as locked:
             if locked.get("child") == record:
