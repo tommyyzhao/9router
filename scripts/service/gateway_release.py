@@ -32,10 +32,18 @@ class ReleaseError(service.ServiceError):
     pass
 
 
+def _ensure_content(destination: Path, content: bytes, mode: int) -> None:
+    if destination.exists():
+        if destination.is_symlink() or not destination.is_file() or destination.read_bytes() != content:
+            raise ReleaseError(f"Existing install artifact differs: {destination}")
+        return
+    service.atomic_write(destination, content, mode)
+
+
 def _copy_atomic(source: Path, destination: Path, mode: int) -> None:
     if source.is_symlink() or not source.is_file():
         raise ReleaseError(f"Source must be a regular file: {source}")
-    service.atomic_write(destination, source.read_bytes(), mode)
+    _ensure_content(destination, source.read_bytes(), mode)
 
 
 def _label(value: str) -> str:
@@ -67,6 +75,7 @@ def _config(args, service_dir: Path, releases_dir: Path, child_log: Path) -> dic
         "home": str(args.home.resolve()),
         "data_dir": str(args.data_dir.resolve()),
         "releases_dir": str(releases_dir.resolve()),
+        "runtime_path": args.runtime_path,
         "child_log": str(child_log.resolve()),
         "startup_timeout": args.startup_timeout,
         "probation": args.probation,
@@ -88,12 +97,11 @@ def install(args) -> None:
     stable_service = bin_dir / "gateway_service.py"
     stable_release = bin_dir / "gateway_release.py"
     staged_gateway_plist = service_dir / f"{label}.supervisor.plist"
+    final_gateway_plist = launch_agents / f"{label}.plist"
     guard_plist = launch_agents / f"{guard_label}.plist"
-    destinations = (service_dir / "state.json", stable_service, stable_release,
-                    staged_gateway_plist, guard_plist)
-    existing = [str(path) for path in destinations if path.exists()]
-    if existing:
-        raise ReleaseError("Install destination already exists; refusing overwrite: " + ", ".join(existing))
+    state_path = service_dir / "state.json"
+    if state_path.exists():
+        raise ReleaseError(f"Install state already exists; use status: {state_path}")
     for directory in (service_dir, bin_dir, launch_agents, args.log_dir.resolve()):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(service_dir, 0o700)
@@ -133,19 +141,22 @@ def install(args) -> None:
         "config": _config(args, service_dir, releases_dir, child_log),
         "guard": {
             "label": guard_label, "service": f"{domain}/{label}", "domain": domain,
-            "stable_plist": str(gateway_plist), "interval": args.guard_interval,
+            "stable_plist": str(gateway_plist), "final_plist": str(final_gateway_plist),
+            "interval": args.guard_interval,
             "bootstrap_attempts": args.bootstrap_attempts,
             "install_health_timeout": args.startup_timeout,
         },
         "guard_status": None,
         "install_transaction": None,
     }
-    store = service.StateStore(service_dir / "state.json")
-    store.create(state)
+    # Artifacts are content-idempotent; state is the final prepare commit. A crash
+    # before it can safely rerun, while mismatched leftovers fail closed.
     _copy_atomic(SOURCE, stable_service, 0o700)
     _copy_atomic(Path(__file__), stable_release, 0o700)
-    service.atomic_write(gateway_plist, gateway_content, 0o600)
-    service.atomic_write(guard_plist, guard_content, 0o600)
+    _ensure_content(gateway_plist, gateway_content, 0o600)
+    _ensure_content(guard_plist, guard_content, 0o600)
+    store = service.StateStore(state_path)
+    store.create(state)
     print(json.dumps({"state": str(store.path), "gateway_plist": str(gateway_plist),
                       "guard_plist": str(guard_plist), "baseline": args.baseline.name}, indent=2))
 
@@ -158,13 +169,17 @@ def arm_install(args) -> None:
     stable = Path(state["guard"]["stable_plist"]).resolve(strict=True)
     fallback_source = args.original_plist.resolve(strict=True)
     fallback_copy = args.service_dir.resolve() / "original-gateway.plist"
-    if fallback_copy.exists():
-        raise ReleaseError("Original gateway backup already exists")
     _copy_atomic(fallback_source, fallback_copy, 0o600)
+    fallback_payload = plistlib.loads(fallback_copy.read_bytes())
+    fallback_arguments = fallback_payload.get("ProgramArguments")
+    if fallback_payload.get("Label") != state["guard"]["service"].rsplit("/", 1)[-1] or not isinstance(fallback_arguments, list):
+        raise ReleaseError("Original plist Label/ProgramArguments do not match guarded job")
     with store.locked() as locked:
         locked["install_transaction"] = {
             "phase": "armed", "stable_plist": str(stable),
             "fallback_plist": str(fallback_copy),
+            "fallback_arguments": fallback_arguments,
+            "final_plist": state["guard"]["final_plist"],
             "original_digest": hashlib.sha256(fallback_copy.read_bytes()).hexdigest(),
             "armed_at": time.time(),
         }
@@ -184,13 +199,15 @@ def _free_loopback_port() -> int:
     return port
 
 
-def validate_candidate_runtime(release: dict, scratch_root: Path, timeout: float) -> None:
+def validate_candidate_runtime(release: dict, scratch_root: Path, timeout: float,
+                               runtime_path: str) -> None:
     port = _free_loopback_port()
     scratch_home = scratch_root / "home"
     scratch_data = scratch_root / "data"
     scratch_home.mkdir(parents=True, mode=0o700)
     scratch_data.mkdir(parents=True, mode=0o700)
     env = os.environ.copy()
+    env["PATH"] = runtime_path
     env.update({
         "HOSTNAME": "127.0.0.1", "PORT": str(port), "HOME": str(scratch_home),
         "DATA_DIR": str(scratch_data), "DISABLE_BACKGROUND_TOKEN_REFRESH": "1",
@@ -238,10 +255,12 @@ def stage(args) -> None:
     release = service.validate_release(args.release, Path(config["releases_dir"]),
                                        Path(baseline["node"]), Path(baseline["env_file"]), schema_digest)
     with tempfile.TemporaryDirectory(prefix="9router-stage-") as raw:
-        validate_candidate_runtime(release, Path(raw), args.timeout)
+        validate_candidate_runtime(release, Path(raw), args.timeout, config["runtime_path"])
     # Rehash after running; a mutable candidate cannot become staged.
-    service.validate_release(args.release, Path(config["releases_dir"]), Path(baseline["node"]),
-                             Path(baseline["env_file"]), schema_digest, release)
+    checked = service.validate_release(args.release, Path(config["releases_dir"]), Path(baseline["node"]),
+                                       Path(baseline["env_file"]), schema_digest)
+    if checked != release:
+        raise ReleaseError("Validated release or stable environment changed")
     with store.locked() as locked:
         if locked.get("transition"):
             raise ReleaseError("A transition appeared while staging")
@@ -254,20 +273,23 @@ def stage(args) -> None:
 
 def promote(args) -> None:
     store = service.StateStore(args.service_dir.resolve(strict=True) / "state.json")
+    snapshot = store.read()
+    if snapshot.get("transition"):
+        raise ReleaseError("A transition is already pending")
+    if args.release_name not in snapshot.get("releases", {}):
+        raise ReleaseError("Release is not staged")
+    target = snapshot["releases"][args.release_name]
+    baseline = snapshot["releases"][snapshot["qualified"]]
+    service.validate_release(Path(target["path"]), Path(snapshot["config"]["releases_dir"]),
+                             Path(target["node"]), Path(target["env_file"]),
+                             target["schema_digest"], target)
+    if target["schema_digest"] != baseline["schema_digest"]:
+        raise ReleaseError("Database compatibility gate blocked promotion")
     with store.locked() as state:
-        if state.get("transition"):
-            raise ReleaseError("A transition is already pending")
-        if args.release_name not in state.get("releases", {}):
-            raise ReleaseError("Release is not staged")
+        if state["generation"] != snapshot["generation"] or state.get("transition"):
+            raise ReleaseError("State changed during validation; retry promotion")
         if state.get("child") is None or state.get("phase") not in {"healthy", "staged"}:
             raise ReleaseError("Current supervised gateway is not healthy")
-        target = state["releases"][args.release_name]
-        baseline = state["releases"][state["qualified"]]
-        service.validate_release(Path(target["path"]), Path(state["config"]["releases_dir"]),
-                                 Path(target["node"]), Path(target["env_file"]),
-                                 target["schema_digest"], target)
-        if target["schema_digest"] != baseline["schema_digest"]:
-            raise ReleaseError("Database compatibility gate blocked promotion")
         state["transition"] = {
             "id": f"{int(time.time())}-{args.release_name}", "phase": "queued",
             "target": args.release_name, "rollback": state["qualified"],

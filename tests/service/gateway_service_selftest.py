@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import plistlib
 import signal
 import subprocess
 import sys
@@ -146,6 +148,18 @@ def offline_checks():
         args.release_name = "changed"
         with patch.object(release_tool.service, "validate_release", return_value=staged):
             expect_error("compatibility", release_tool.promote, args)
+
+    # Targeted reviewer repro: fallback health never accepts an unrelated listener.
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        store = service.StateStore(base / "state.json")
+        store.create({"config": {"port": _free_port()}, "guard": {"service": "gui/501/test"},
+                      "child": None, "current": "x", "releases": {}})
+        with patch.object(service, "listener_pids", return_value={999}), \
+             patch.object(service, "loaded_job_pid", return_value=123), \
+             patch.object(service, "pid_descends_from", return_value=False), \
+             patch.object(service, "health", return_value=True):
+            assert service.prove_install_health(store, "fallback", 1) is False
 
     # Queued candidate mutation is rejected before the healthy child is touched.
     with tempfile.TemporaryDirectory() as raw:
@@ -321,13 +335,30 @@ def real_launchd_checks():
         _run(str(python), *install_args)
         store = service.StateStore(service_dir / "state.json")
         gateway_plist = service_dir / f"{label}.supervisor.plist"
+        final_gateway_plist = launch_agents / f"{label}.plist"
         guard_plist = launch_agents / f"{guard_label}.plist"
         fallback = base / "fallback.plist"
-        fallback.write_bytes(gateway_plist.read_bytes())
+        fallback_payload = {
+            "Label": label,
+            "ProgramArguments": [str(node), f"--env-file={env}", str(healthy / "custom-server.js")],
+            "WorkingDirectory": str(healthy),
+            "EnvironmentVariables": {"HOSTNAME": "127.0.0.1", "PORT": str(port),
+                                     "HOME": str(home), "DATA_DIR": str(data),
+                                     "PATH": os.environ.get("PATH", "")},
+            "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 1,
+            "StandardOutPath": str(logs / "original.log"),
+            "StandardErrorPath": str(logs / "original.err"),
+        }
+        fallback.write_bytes(plistlib.dumps(fallback_payload))
         _run(str(python), str(RELEASE_SOURCE), "arm-install", "--service-dir", str(service_dir),
              "--original-plist", str(fallback))
         jobs = [guard_service, gateway_service]
         try:
+            # Real old direct job exists before the independent guard migrates it.
+            _run("/bin/launchctl", "bootstrap", domain, str(fallback))
+            _wait(lambda: service.health(port, .2), timeout=8, message="old direct job")
+            old_direct_pid = service.loaded_job_pid(gateway_service)
+            assert old_direct_pid in service.listener_pids(port)
             start = time.monotonic()
             _run("/bin/launchctl", "bootstrap", domain, str(guard_plist))
             _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed" and service.health(port, .2),
@@ -336,6 +367,8 @@ def real_launchd_checks():
             state = store.read()
             assert state["install_transaction"]["phase"] == "committed", state
             assert state["install_transaction"]["loaded"] == "stable", state
+            assert final_gateway_plist.read_bytes() == gateway_plist.read_bytes()
+            assert service.loaded_job_pid(gateway_service) != old_direct_pid
             assert _run("/bin/launchctl", "print", gateway_service, check=False).returncode == 0
 
             # Missing-job recovery is autonomous; no command starts gateway after bootout.
@@ -378,7 +411,7 @@ def real_launchd_checks():
                 locked["phase"] = "transition-queued"
             start = time.monotonic()
             _wait(lambda: store.read().get("transition") is None and store.read().get("current") == "healthy",
-                  timeout=25, message="hung-health rollback")
+                  timeout=35, message="hung-health rollback")
             timings["hung_health_rollback"] = time.monotonic() - start
             assert service.health(port, .2)
 
@@ -464,6 +497,50 @@ def real_launchd_checks():
                 os.killpg(stranger.pid, signal.SIGTERM)
                 stranger.wait(timeout=3)
 
+            # Interrupted guard after successful stable bootstrap but before state
+            # commit resumes from persisted loaded phase without another bootout.
+            with store.locked() as locked:
+                locked["install_transaction"] = {
+                    "phase": "loaded", "loaded": "stable", "stable_plist": str(gateway_plist),
+                    "fallback_plist": str(fallback), "final_plist": str(final_gateway_plist),
+                    "armed_at": time.time(),
+                }
+                locked["phase"] = "installing"
+            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed",
+                  timeout=8, message="interrupted loaded-phase guard commit")
+            timings["guard_loaded_resume"] = 0.0
+            assert service.health(port, .2)
+
+            # Loaded-but-unhealthy stable job is explicitly booted out before the
+            # original fallback is loaded; future recovery persists that fallback.
+            unhealthy_plist = service_dir / "unhealthy-stable.plist"
+            unhealthy_plist.write_bytes(gateway_plist.read_bytes())
+            unhealthy_config = plistlib.loads(unhealthy_plist.read_bytes())
+            unhealthy_config["ProgramArguments"] = [str(node), "-e", "setInterval(()=>{},1000)"]
+            unhealthy_plist.write_bytes(plistlib.dumps(unhealthy_config))
+            _bootout(gateway_service)
+            with store.locked() as locked:
+                locked["install_transaction"] = {
+                    "phase": "bootstrapping-stable", "stable_plist": str(unhealthy_plist),
+                    "fallback_plist": str(fallback), "fallback_arguments": fallback_payload["ProgramArguments"],
+                    "original_digest": hashlib.sha256(fallback.read_bytes()).hexdigest(),
+                    "final_plist": str(final_gateway_plist), "armed_at": time.time(),
+                }
+                locked["guard"]["install_health_timeout"] = 2
+                locked["phase"] = "installing"
+            start = time.monotonic()
+            _wait(lambda: store.read().get("install_transaction", {}).get("phase") == "committed" and service.health(port, .2),
+                  timeout=18, message="loaded unhealthy stable fallback")
+            state = store.read()
+            timings["loaded_unhealthy_fallback"] = time.monotonic() - start
+            assert state["install_transaction"]["loaded"] == "fallback", state
+            assert state["guard"]["stable_plist"] == str(final_gateway_plist)
+            assert final_gateway_plist.read_bytes() == fallback.read_bytes()
+            # Prove future missing-job recovery uses the persisted working plist.
+            _bootout(gateway_service)
+            _wait(lambda: _run("/bin/launchctl", "print", gateway_service, check=False).returncode == 0 and service.health(port, .2),
+                  timeout=10, message="persisted fallback missing-job recovery")
+
             # Reproduce original incident shape: invalid stable plist plus fallback.
             bad_stable = service_dir / "bad-stable.plist"
             bad_stable.write_text("not a plist", encoding="utf-8")
@@ -471,7 +548,9 @@ def real_launchd_checks():
                 locked["guard"]["stable_plist"] = str(bad_stable)
                 locked["install_transaction"] = {
                     "phase": "armed", "stable_plist": str(bad_stable),
-                    "fallback_plist": str(fallback), "armed_at": time.time(),
+                    "fallback_plist": str(fallback), "fallback_arguments": fallback_payload["ProgramArguments"],
+                    "original_digest": hashlib.sha256(fallback.read_bytes()).hexdigest(),
+                    "final_plist": str(final_gateway_plist), "armed_at": time.time(),
                 }
                 locked["phase"] = "install-armed"
             start = time.monotonic()

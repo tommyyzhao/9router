@@ -573,6 +573,7 @@ def rollback(store: StateStore, config: dict[str, Any], reason: str) -> dict[str
         return None
     with store.locked() as locked:
         locked["current"] = target_name
+        locked["qualified"] = target_name
         locked["transition"] = None
         locked["phase"] = "healthy"
         locked["failures"] = []
@@ -719,15 +720,47 @@ def launchctl(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess[
         raise ServiceError(f"launchctl {' '.join(args[:2])} failed: {error}") from error
 
 
+def loaded_job_pid(service: str) -> int | None:
+    result = launchctl("print", service, timeout=5)
+    if result.returncode:
+        return None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("pid = ") and stripped[6:].isdigit():
+            return int(stripped[6:])
+    return None
+
+
 def _loaded(service: str) -> bool:
     return launchctl("print", service, timeout=5).returncode == 0
 
 
-def bootstrap_one(domain: str, service: str, plist: Path, name: str,
-                  attempts: int = 3) -> str:
-    errors: list[str] = []
+def validate_plist(plist: Path, service: str, expected_arguments: list[str] | None = None,
+                   expected_digest: str | None = None) -> None:
     if not plist.is_file() or plist.is_symlink():
-        raise ServiceError(f"{name} plist unavailable")
+        raise ServiceError(f"plist unavailable: {plist}")
+    content = plist.read_bytes()
+    if expected_digest and hashlib.sha256(content).hexdigest() != expected_digest:
+        raise ServiceError("Fallback plist digest changed")
+    try:
+        payload = plistlib.loads(content)
+    except Exception as error:
+        raise ServiceError(f"Invalid plist: {plist}: {error}") from error
+    expected_label = service.rsplit("/", 1)[-1]
+    if payload.get("Label") != expected_label:
+        raise ServiceError("Plist Label does not match guarded service")
+    arguments = payload.get("ProgramArguments")
+    if not isinstance(arguments, list) or not arguments:
+        raise ServiceError("Plist has no ProgramArguments")
+    if expected_arguments is not None and arguments != expected_arguments:
+        raise ServiceError("Plist ProgramArguments changed")
+
+
+def bootstrap_one(domain: str, service: str, plist: Path, name: str,
+                  attempts: int = 3, expected_digest: str | None = None,
+                  expected_arguments: list[str] | None = None) -> str:
+    errors: list[str] = []
+    validate_plist(plist, service, expected_arguments, expected_digest)
     for attempt in range(attempts):
         result = launchctl("bootstrap", domain, str(plist))
         if result.returncode == 0 and _loaded(service):
@@ -753,9 +786,28 @@ def bootstrap_with_fallback(domain: str, service: str, stable_plist: Path,
             raise ServiceError(f"{stable_error}; {fallback_error}") from fallback_error
 
 
+def pid_descends_from(pid: int, ancestor: int, ps: str = "/bin/ps") -> bool:
+    output = _run_probe([ps, "-axo", "pid=,ppid="])
+    parents = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) == 2:
+            parents[int(fields[0])] = int(fields[1])
+    seen = set()
+    while pid != ancestor:
+        if pid in seen or pid not in parents or pid <= 1:
+            return False
+        seen.add(pid)
+        pid = parents[pid]
+    return True
+
+
 def prove_install_health(store: StateStore, expected: str, timeout: float) -> bool:
     state = store.read()
     record = state.get("child")
+    listeners = listener_pids(int(state["config"]["port"]))
+    if not listeners:
+        return False
     if expected == "stable":
         if not isinstance(record, dict):
             return False
@@ -765,6 +817,13 @@ def prove_install_health(store: StateStore, expected: str, timeout: float) -> bo
         try:
             prove_child(record, require_listener=True)
         except ServiceError:
+            return False
+    else:
+        service_name = state["guard"]["service"]
+        job_pid = loaded_job_pid(service_name)
+        if job_pid is None or not listeners:
+            return False
+        if not all(pid_descends_from(pid, job_pid) for pid in listeners):
             return False
     return health(int(state["config"]["port"]), min(timeout, 2))
 
@@ -806,8 +865,11 @@ def guard(service_dir: Path) -> None:
                         result = launchctl("bootout", service)
                         if result.returncode != 0 and _loaded(service):
                             raise ServiceError(f"fallback bootout failed exit={result.returncode}")
-                    selected = bootstrap_one(domain, service, Path(transaction["fallback_plist"]),
-                                             "fallback", int(guard_config.get("bootstrap_attempts", 3)))
+                    selected = bootstrap_one(
+                        domain, service, Path(transaction["fallback_plist"]), "fallback",
+                        int(guard_config.get("bootstrap_attempts", 3)),
+                        transaction.get("original_digest"), transaction.get("fallback_arguments"),
+                    )
                     with store.locked() as locked:
                         locked["install_transaction"]["loaded"] = selected
                         locked["install_transaction"]["phase"] = "loaded"
@@ -829,9 +891,14 @@ def guard(service_dir: Path) -> None:
                                 _diagnostic(locked, "Stable gateway unhealthy; restoring original job")
                             continue
                         raise ServiceError("fallback gateway health deadline exceeded")
+                    active_key = "stable_plist" if selected == "stable" else "fallback_plist"
+                    latest = store.read()
+                    active_plist = Path(latest["install_transaction"][active_key])
+                    final_plist = Path(latest["install_transaction"]["final_plist"])
+                    atomic_write(final_plist, active_plist.read_bytes(), 0o600)
                     with store.locked() as locked:
                         locked["install_transaction"]["phase"] = "committed"
-                        locked["guard"]["stable_plist"] = locked["install_transaction"]["stable_plist" if selected == "stable" else "fallback_plist"]
+                        locked["guard"]["stable_plist"] = str(final_plist)
                         locked["phase"] = "healthy"
                         _diagnostic(locked, f"Installation transaction committed on {selected}")
             elif not _loaded(service):
