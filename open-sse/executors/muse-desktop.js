@@ -33,6 +33,16 @@ const SUBSCRIBE_TIMEOUT_MS = 30000;
 // history on every request. Correctness never depends on it — turn events are
 // correlated by message_id.
 const lastSeqByVm = new Map();
+const activeTurns = new Set();
+
+function acquireTurn(session) {
+  const key = `${session.gatewayHost}\u0000${session.vmId}`;
+  if (activeTurns.has(key)) {
+    throw new Error("muse-desktop: another turn is active for this session");
+  }
+  activeTurns.add(key);
+  return () => activeTurns.delete(key);
+}
 
 function bareModel(model) {
   const s = String(model || "");
@@ -208,7 +218,20 @@ export class MuseDesktopExecutor extends BaseExecutor {
     const session = resolveMuseSession(credentials);
     const items = toHatchItems(body);
     if (!items[0].text) throw new Error("muse-desktop: empty prompt");
-    const proxyAgent = await buildProxyAgent();
+    const releaseTurn = acquireTurn(session);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      releaseTurn();
+    };
+    let proxyAgent;
+    try {
+      proxyAgent = await buildProxyAgent();
+    } catch (error) {
+      release();
+      throw error;
+    }
     const responseId = `chatcmpl-muse-${crypto.randomUUID().slice(0, 8)}`;
     const created = Math.floor(Date.now() / 1000);
     const modelId = bareModel(model) || "muse-spark";
@@ -222,6 +245,8 @@ export class MuseDesktopExecutor extends BaseExecutor {
       } catch (e) {
         if (isAuthFailure(e)) throw new Error(`Muse Desktop session expired or rejected (${e.message}). Reconnect your Muse session.`);
         throw e;
+      } finally {
+        release();
       }
       const completion = {
         id: responseId, object: "chat.completion", created, model: modelId,
@@ -253,7 +278,7 @@ export class MuseDesktopExecutor extends BaseExecutor {
           sentRole = true;
           controller.enqueue(encoder.encode(chunk));
         };
-        this.runTurn({
+          this.runTurn({
           session, items, signal: mergedSignal, log, proxyAgent,
           onDelta: (text) => { if (!cancelled && text) sendDelta(text); },
         }).then(
@@ -272,11 +297,12 @@ export class MuseDesktopExecutor extends BaseExecutor {
             controller.enqueue(encoder.encode(SSE_DONE));
             controller.close();
           },
-        );
+        ).finally(release);
       },
       cancel: () => {
         cancelled = true;
         streamAbort.abort();
+        release();
       },
     });
 

@@ -95,8 +95,9 @@ class CipherState {
 class SymmetricState {
   constructor() {
     this.cs = new CipherState();
-    // h = SHA256(pad32("Noise_XX_25519_AESGCM_SHA256")); empty prologue mixed.
-    this.h = sha256(Buffer.concat([PROTOCOL_NAME, Buffer.alloc(32 - PROTOCOL_NAME.length)]));
+    // Noise initializes h to protocol_name padded to HASHLEN (not hashed).
+    // Empty prologue is mixed exactly once below.
+    this.h = Buffer.concat([PROTOCOL_NAME, Buffer.alloc(HASH_LEN - PROTOCOL_NAME.length)]);
     this.ck = Buffer.from(this.h);
     this.mixHash(Buffer.alloc(0));
   }

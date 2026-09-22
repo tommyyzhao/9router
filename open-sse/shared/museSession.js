@@ -121,13 +121,18 @@ export function resolveMuseSession(credentials) {
   };
 }
 
-/** True when the error looks like an expired/rejected admission token. */
+/** True only for an explicit admission/session authentication rejection. */
 export function isAuthFailure(err) {
-  const m = String(err?.message || "").toLowerCase();
-  return (
-    m.includes("401") || m.includes("403") || m.includes("unauthorized") ||
-    m.includes("forbidden") || m.includes("auth") || m.includes("token")
-  );
+  const status = Number(err?.status ?? err?.statusCode ?? err?.response?.status);
+  if (status === 401 || status === 403) return true;
+
+  const code = String(err?.code || "").toUpperCase();
+  if (code === "UNAUTHORIZED" || code === "FORBIDDEN" || code === "AUTH_REQUIRED") return true;
+
+  const message = String(err?.message || "");
+  return /\b(?:unauthorized|forbidden)\b/i.test(message) ||
+    /\b(?:expired|invalid|rejected)\s+(?:Muse\s+Desktop\s+)?(?:admission|session|access)?\s*token\b/i.test(message) ||
+    /\b(?:admission|session|access)\s+token\s+(?:expired|invalid|rejected)\b/i.test(message);
 }
 
 export const __test__ = { b64urlDecode };

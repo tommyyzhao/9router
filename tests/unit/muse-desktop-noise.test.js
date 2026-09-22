@@ -76,6 +76,16 @@ function makeResponder() {
 }
 
 describe("muse Noise XX handshake (loopback)", () => {
+  it("initializes Noise state from the padded protocol name", () => {
+    const init = new NoiseXXInitiator();
+    expect(init.ss.ck.toString("hex")).toBe(
+      "4e6f6973655f58585f32353531395f41455347434d5f53484132353600000000",
+    );
+    expect(init.ss.h.toString("hex")).toBe(
+      "5df72b67b965add1168f0a6c756df21c204f7e64fc682be6a3ab4b682c8db64b",
+    );
+  });
+
   it("completes with matching transport keys", () => {
     const init = new NoiseXXInitiator();
     const rsp = makeResponder();

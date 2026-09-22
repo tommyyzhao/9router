@@ -49,8 +49,11 @@ describe("muse-desktop session", () => {
   });
 
   it("detects auth failures", () => {
+    expect(isAuthFailure(Object.assign(new Error("gateway rejected session"), { status: 401 }))).toBe(true);
     expect(isAuthFailure(new Error("401 Unauthorized"))).toBe(true);
     expect(isAuthFailure(new Error("handshake timeout"))).toBe(false);
+    expect(isAuthFailure(new Error("Unsupported state or unable to authenticate data"))).toBe(false);
+    expect(isAuthFailure(new Error("tokenizer failed"))).toBe(false);
   });
 });
 
@@ -114,6 +117,25 @@ describe("muse-desktop executor", () => {
   it("targets the Noise gateway, not HTTPS", () => {
     const ex = new MuseDesktopExecutor();
     expect(ex.buildUrl()).toBe("wss://hatch.metaaivm.com/v1/noise");
+  });
+
+  it("rejects concurrent turns for the same VM", async () => {
+    const ex = new MuseDesktopExecutor();
+    let release;
+    ex.runTurn = vi.fn(() => new Promise((resolve) => { release = resolve; }));
+    const token = fakeJwt({ env_id: "vm-locked" });
+    const args = {
+      model: "muse-spark",
+      body: { messages: [{ role: "user", content: "ping" }] },
+      stream: false,
+      credentials: { providerSpecificData: { museAdmissionToken: token } },
+      log: null,
+    };
+    const first = ex.execute(args);
+    await vi.waitFor(() => expect(ex.runTurn).toHaveBeenCalledOnce());
+    await expect(ex.execute(args)).rejects.toThrow(/another turn is active/);
+    release({ text: "PONG", usage: null, events: [] });
+    await first;
   });
 
   it("bridges a successful PONG turn into OpenAI SSE", async () => {
