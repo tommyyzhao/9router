@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
 import { flattenMessagesToEnvelope } from "./grokBotEnvelope.js";
+import { parseAssistantCompletion } from "./grokBotTools.js";
 
 const DEFAULT_BASE = "https://api2.cursor.sh";
 
@@ -85,7 +86,7 @@ export async function createTemporalWorker({ accessToken, machineId, base = DEFA
     encStr(
       3,
       description ??
-        "Stateless API worker. Obey only the instruction block in the user message.",
+        "Stateless OpenAI API worker. No filesystem/shell. If TOOLS are listed, emit tool_calls JSON only; otherwise plain text. Obey the envelope.",
     ),
     encStr(4, "Worker"),
     encStr(8, agentId),
@@ -116,11 +117,12 @@ export async function sendEnvelopedUserMessage({
   machineId,
   agentId,
   messages,
+  tools,
   base = DEFAULT_BASE,
   signal,
 }) {
   const headers = sandHeaders(accessToken, machineId);
-  const envelope = flattenMessagesToEnvelope(messages || []);
+  const envelope = flattenMessagesToEnvelope(messages || [], { tools });
   const messageId = crypto.randomUUID();
   const sendBody = Buffer.concat([
     encStr(1, agentId),
@@ -197,12 +199,13 @@ export async function deleteAgent({ accessToken, machineId, agentId, base = DEFA
 
 /**
  * Full ephemeral completion: create → send → poll list → delete.
- * @returns {{ text: string, agentId: string, messageId: string }}
+ * @returns {{ text: string|null, toolCalls: Array|null, finishReason: string, agentId: string, messageId: string }}
  */
 export async function runEphemeralCompletion({
   accessToken,
   machineId,
   messages,
+  tools,
   base = DEFAULT_BASE,
   signal,
   pollMs = 1500,
@@ -222,6 +225,7 @@ export async function runEphemeralCompletion({
       machineId,
       agentId,
       messages,
+      tools,
       base,
       signal,
     });
@@ -242,7 +246,23 @@ export async function runEphemeralCompletion({
       err.code = "ephemeral_timeout";
       throw err;
     }
-    return { text: assistantText, agentId, messageId: sent.messageId };
+    const parsed = parseAssistantCompletion(assistantText);
+    if (parsed.kind === "tool_calls") {
+      return {
+        text: null,
+        toolCalls: parsed.toolCalls,
+        finishReason: "tool_calls",
+        agentId,
+        messageId: sent.messageId,
+      };
+    }
+    return {
+      text: parsed.text,
+      toolCalls: null,
+      finishReason: "stop",
+      agentId,
+      messageId: sent.messageId,
+    };
   } finally {
     const idForDelete = numericId || agentId;
     if (idForDelete) {

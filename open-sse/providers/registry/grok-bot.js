@@ -33,11 +33,11 @@ export default {
   category: "oauth",
   authModes: ["oauth"],
   hasOAuth: true,
-  // Mirror Cursor transport for future stream reuse (executor currently refuses chat).
+  // OpenAI chat-completions shape: executor returns native OpenAI JSON/SSE (no cursor translate).
   transport: {
     baseUrl: "https://api2.cursor.sh",
-    chatPath: "/aiserver.v1.ChatService/StreamUnifiedChatWithTools",
-    format: "cursor",
+    chatPath: "/v1/chat/completions",
+    format: "openai",
     headers: {
       "connect-accept-encoding": "gzip",
       "connect-protocol-version": "1",

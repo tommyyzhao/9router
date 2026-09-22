@@ -264,25 +264,36 @@ async function createBypassRequest(parsedUrl, realIP, options) {
       };
 
       const req = https.request(reqOptions, (res) => {
-        const response = {
-          ok: res.statusCode >= HTTP_SUCCESS_MIN && res.statusCode < HTTP_SUCCESS_MAX,
-          status: res.statusCode,
-          statusText: res.statusMessage,
-          headers: new Map(Object.entries(res.headers)),
-          body: Readable.toWeb(res),
-          text: async () => {
-            const chunks = [];
-            for await (const chunk of res) chunks.push(chunk);
-            return Buffer.concat(chunks).toString();
-          },
-          json: async () => JSON.parse(await response.text()),
-        };
-        resolve(response);
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const buf = Buffer.concat(chunks);
+          const response = {
+            ok: res.statusCode >= HTTP_SUCCESS_MIN && res.statusCode < HTTP_SUCCESS_MAX,
+            status: res.statusCode,
+            statusText: res.statusMessage,
+            headers: new Map(Object.entries(res.headers)),
+            body: null,
+            arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+            text: async () => buf.toString("utf8"),
+            json: async () => JSON.parse(buf.toString("utf8")),
+          };
+          resolve(response);
+        });
+        res.on("error", reject);
       });
 
       req.on("error", reject);
       if (options.body) {
-        req.write(typeof options.body === "string" ? options.body : JSON.stringify(options.body));
+        const body = options.body;
+        if (typeof body === "string" || Buffer.isBuffer(body) || body instanceof Uint8Array) {
+          req.write(body);
+        } else if (body && typeof body === "object" && typeof body.arrayBuffer === "function") {
+          // Blob / Request body — not expected on this path; fall through to string
+          req.write(String(body));
+        } else {
+          req.write(JSON.stringify(body));
+        }
       }
       req.end();
     });

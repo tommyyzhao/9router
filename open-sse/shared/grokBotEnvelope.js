@@ -1,7 +1,8 @@
 /**
- * Flatten OpenAI chat `messages` into a single SendGrokBotUserMessage text envelope.
- * Pure helper — no I/O, no tokens. See docs/plans/2026-09-21-grok-bot-ephemeral-harness.md
+ * Flatten OpenAI chat `messages` (+ optional tools) into a SendGrokBotUserMessage envelope.
+ * Pure helper — no I/O, no tokens.
  */
+import { formatToolsBlock, toolProtocolText } from "./grokBotTools.js";
 
 const ENVELOPE_START = "<<<9ROUTER_ENVELOPE v1>>>";
 const ENVELOPE_END = "<<<END>>>";
@@ -26,29 +27,38 @@ function contentToText(content) {
   return String(content);
 }
 
-function roleLabel(role) {
-  switch (role) {
-    case "system":
-      return "system";
-    case "user":
-      return "user";
-    case "assistant":
-      return "assistant";
-    case "tool":
-      return "tool";
-    case "function":
-      return "tool";
-    default:
-      return role || "unknown";
+function formatAssistantLine(m) {
+  const text = contentToText(m.content).trimEnd();
+  const calls = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+  if (calls.length) {
+    const rendered = calls
+      .map((tc) => {
+        const name = tc?.function?.name || tc?.name || "?";
+        const args = tc?.function?.arguments ?? "";
+        const id = tc?.id || "";
+        return `tool_call id=${id} name=${name} arguments=${typeof args === "string" ? args : JSON.stringify(args)}`;
+      })
+      .join("\n");
+    if (text) return `assistant: ${text}\n${rendered}`;
+    return `assistant:\n${rendered}`;
   }
+  return `assistant: ${text}`;
+}
+
+function formatToolLine(m) {
+  const text = contentToText(m.content).trimEnd();
+  const id = m.tool_call_id || m.name || "";
+  return `tool id=${id}: ${text}`;
 }
 
 /**
- * @param {Array<{role:string, content?:unknown, name?:string}>} messages
+ * @param {Array} messages
+ * @param {{ tools?: unknown[] }} [options]
  * @returns {string}
  */
-export function flattenMessagesToEnvelope(messages) {
+export function flattenMessagesToEnvelope(messages, options = {}) {
   const list = Array.isArray(messages) ? messages : [];
+  const tools = options.tools;
   const systems = [];
   const history = [];
   let finalUser = "";
@@ -63,25 +73,45 @@ export function flattenMessagesToEnvelope(messages) {
 
   for (const m of list) {
     if (!m) continue;
-    const text = contentToText(m.content).trimEnd();
     if (m.role === "system") {
+      const text = contentToText(m.content).trimEnd();
       if (text) systems.push(text);
-      continue;
     }
   }
 
+  // Always inject tool protocol when tools are present; also when history has tool turns
+  const hasToolTurns = nonSystem.some(
+    (m) => m.role === "tool" || m.role === "function" || (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length),
+  );
+  const needProtocol = (Array.isArray(tools) && tools.length > 0) || hasToolTurns;
+  if (needProtocol) {
+    systems.unshift(toolProtocolText());
+  }
+
   nonSystem.forEach((m, idx) => {
-    const text = contentToText(m.content).trimEnd();
     if (idx === lastUserIdx && m.role === "user") {
-      finalUser = text;
+      finalUser = contentToText(m.content).trimEnd();
       return;
     }
-    const label = roleLabel(m.role);
-    history.push(`${label}: ${text}`);
+    if (m.role === "assistant") {
+      history.push(formatAssistantLine(m));
+      return;
+    }
+    if (m.role === "tool" || m.role === "function") {
+      history.push(formatToolLine(m));
+      return;
+    }
+    if (m.role === "user") {
+      history.push(`user: ${contentToText(m.content).trimEnd()}`);
+      return;
+    }
+    history.push(`${m.role || "unknown"}: ${contentToText(m.content).trimEnd()}`);
   });
 
   const parts = [ENVELOPE_START, "[SYSTEM]"];
   parts.push(systems.length ? systems.join("\n\n") : "(none)");
+  parts.push("", "[TOOLS]");
+  parts.push(formatToolsBlock(tools));
   parts.push("", "[HISTORY]");
   parts.push(history.length ? history.join("\n") : "(none)");
   parts.push("", "[USER]");

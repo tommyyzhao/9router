@@ -5,16 +5,16 @@ import { HTTP_STATUS } from "../config/runtimeConfig.js";
 import { buildCursorHeaders } from "../utils/cursorChecksum.js";
 import { CHAT_PATH_PROBE } from "../shared/grokBotAccount.js";
 import { runEphemeralCompletion } from "../shared/grokBotEphemeral.js";
+import { toOpenAiToolCallsMessage } from "../shared/grokBotTools.js";
+import { FORMATS } from "../translator/formats.js";
 import { chatChunkSse } from "../utils/sse.js";
 import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
 
 /**
- * Grok Bot Desktop executor — ephemeral TEMPORAL harness.
+ * Grok Bot Desktop executor — ephemeral TEMPORAL harness, native OpenAI I/O.
  *
- * /v1/chat/completions → create TEMPORAL worker → enveloped Send → list transcript
- * → OpenAI SSE/JSON → delete worker. Never routes through SFC / personal BOX agents.
- *
- * See docs/plans/2026-09-21-grok-bot-ephemeral-harness.md
+ * transport.format = openai so chatCore does not cursor-translate.
+ * Returns responseFormat FORMATS.OPENAI. Supports tool_calls via text protocol.
  */
 export class GrokBotDesktopExecutor extends BaseExecutor {
   constructor() {
@@ -55,11 +55,13 @@ export class GrokBotDesktopExecutor extends BaseExecutor {
           }),
           { status: HTTP_STATUS.UNAUTHORIZED || 401, headers: { "Content-Type": "application/json" } },
         ),
+        responseFormat: FORMATS.OPENAI,
       };
     }
 
     const messages = Array.isArray(body?.messages) ? body.messages : [];
-    const modelId = model || body?.model || "default";
+    const tools = Array.isArray(body?.tools) ? body.tools : undefined;
+    const modelId = typeof model === "string" ? model.split("/").pop() : model || body?.model || "default";
     const base = this.config?.baseUrl || "https://api2.cursor.sh";
 
     let result;
@@ -68,6 +70,7 @@ export class GrokBotDesktopExecutor extends BaseExecutor {
         accessToken,
         machineId,
         messages,
+        tools,
         base,
         signal,
         log,
@@ -86,13 +89,19 @@ export class GrokBotDesktopExecutor extends BaseExecutor {
           }),
           { status, headers: { "Content-Type": "application/json" } },
         ),
+        responseFormat: FORMATS.OPENAI,
       };
     }
 
     const id = `chatcmpl-${crypto.randomUUID().slice(0, 24)}`;
     const created = Math.floor(Date.now() / 1000);
+    const finishReason = result.finishReason || "stop";
+    const isTools = finishReason === "tool_calls" && Array.isArray(result.toolCalls) && result.toolCalls.length > 0;
 
     if (!stream) {
+      const message = isTools
+        ? toOpenAiToolCallsMessage(result.toolCalls)
+        : { role: "assistant", content: result.text ?? "" };
       const payload = {
         id,
         object: "chat.completion",
@@ -101,8 +110,8 @@ export class GrokBotDesktopExecutor extends BaseExecutor {
         choices: [
           {
             index: 0,
-            message: { role: "assistant", content: result.text },
-            finish_reason: "stop",
+            message,
+            finish_reason: finishReason,
           },
         ],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
@@ -112,34 +121,49 @@ export class GrokBotDesktopExecutor extends BaseExecutor {
           status: 200,
           headers: { "Content-Type": "application/json" },
         }),
+        responseFormat: FORMATS.OPENAI,
       };
     }
 
     const encoder = new TextEncoder();
     const responseStream = new ReadableStream({
       start(controller) {
-        controller.enqueue(
-          encoder.encode(
-            chatChunkSse({
-              id,
-              created,
-              model: modelId,
-              delta: { role: "assistant", content: result.text },
-              finishReason: null,
-            }),
-          ),
-        );
-        controller.enqueue(
-          encoder.encode(
-            chatChunkSse({
-              id,
-              created,
-              model: modelId,
-              delta: {},
-              finishReason: "stop",
-            }),
-          ),
-        );
+        const push = (delta, fr = null) => {
+          controller.enqueue(
+            encoder.encode(
+              chatChunkSse({
+                id,
+                created,
+                model: modelId,
+                delta,
+                finishReason: fr,
+              }),
+            ),
+          );
+        };
+
+        if (isTools) {
+          push({ role: "assistant", content: null });
+          result.toolCalls.forEach((tc, index) => {
+            push({
+              tool_calls: [
+                {
+                  index,
+                  id: tc.id,
+                  type: tc.type || "function",
+                  function: {
+                    name: tc.function.name,
+                    arguments: tc.function.arguments || "",
+                  },
+                },
+              ],
+            });
+          });
+          push({}, "tool_calls");
+        } else {
+          push({ role: "assistant", content: result.text ?? "" });
+          push({}, "stop");
+        }
         controller.enqueue(encoder.encode(SSE_DONE));
         controller.close();
       },
@@ -147,6 +171,7 @@ export class GrokBotDesktopExecutor extends BaseExecutor {
 
     return {
       response: new Response(responseStream, { headers: SSE_HEADERS }),
+      responseFormat: FORMATS.OPENAI,
     };
   }
 }

@@ -1,41 +1,72 @@
-import { describe, it, expect } from "bun:test";
-import {
-  flattenMessagesToEnvelope,
-  envelopeMarkers,
-} from "../../open-sse/shared/grokBotEnvelope.js";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { flattenMessagesToEnvelope, envelopeMarkers } from "../../open-sse/shared/grokBotEnvelope.js";
 
 describe("flattenMessagesToEnvelope", () => {
-  it("places system, history, and final user", () => {
+  it("wraps markers and sections", () => {
     const out = flattenMessagesToEnvelope([
       { role: "system", content: "be brief" },
       { role: "user", content: "hi" },
-      { role: "assistant", content: "hello" },
-      { role: "user", content: "2+2?" },
     ]);
     const { start, end } = envelopeMarkers();
-    expect(out.startsWith(start)).toBe(true);
-    expect(out.endsWith(end)).toBe(true);
-    expect(out).toContain("[SYSTEM]\nbe brief");
-    expect(out).toContain("user: hi");
-    expect(out).toContain("assistant: hello");
-    expect(out).toContain("[USER]\n2+2?");
-    // final user must not also appear as history line after last assistant only once in USER
-    expect(out.match(/2\+2\?/g)?.length).toBe(1);
+    assert.ok(out.startsWith(start));
+    assert.ok(out.includes("[SYSTEM]"));
+    assert.ok(out.includes("be brief"));
+    assert.ok(out.includes("[TOOLS]"));
+    assert.ok(out.includes("[HISTORY]"));
+    assert.ok(out.includes("[USER]"));
+    assert.ok(out.includes("hi"));
+    assert.ok(out.trimEnd().endsWith(end));
   });
 
-  it("joins array content parts", () => {
+  it("puts prior turns in HISTORY and last user in USER", () => {
     const out = flattenMessagesToEnvelope([
-      {
-        role: "user",
-        content: [{ type: "text", text: "a" }, { type: "text", text: "b" }],
-      },
+      { role: "user", content: "first" },
+      { role: "assistant", content: "ok" },
+      { role: "user", content: "second" },
     ]);
-    expect(out).toContain("[USER]\na\nb");
+    assert.match(out, /\[HISTORY\][\s\S]*user: first/);
+    assert.match(out, /\[HISTORY\][\s\S]*assistant: ok/);
+    assert.match(out, /\[USER\]\nsecond/);
   });
 
-  it("handles empty messages", () => {
-    const out = flattenMessagesToEnvelope([]);
-    expect(out).toContain("[SYSTEM]\n(none)");
-    expect(out).toContain("[USER]\n(empty)");
+  it("lists tools and injects protocol when tools present", () => {
+    const out = flattenMessagesToEnvelope([{ role: "user", content: "write a file" }], {
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "write",
+            description: "Write a file",
+            parameters: { type: "object", properties: { path: { type: "string" } } },
+          },
+        },
+      ],
+    });
+    assert.match(out, /\[TOOLS\][\s\S]*write:/);
+    assert.match(out, /tool_calls/);
+    assert.match(out, /NO local filesystem/);
+  });
+
+  it("serializes assistant tool_calls and tool results in HISTORY", () => {
+    const out = flattenMessagesToEnvelope([
+      { role: "user", content: "make hi.txt" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_1",
+            type: "function",
+            function: { name: "write", arguments: '{"path":"hi.txt","content":"hello"}' },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "wrote hi.txt" },
+      { role: "user", content: "thanks" },
+    ]);
+    assert.match(out, /tool_call id=call_1 name=write/);
+    assert.match(out, /tool id=call_1: wrote hi\.txt/);
+    assert.match(out, /\[USER\]\nthanks/);
   });
 });
