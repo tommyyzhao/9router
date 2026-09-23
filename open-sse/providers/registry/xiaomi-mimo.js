@@ -3,7 +3,8 @@ import { CLAUDE_API_HEADERS } from "../shared.js";
 // Dual auth (same pattern as kimi):
 //   - API key (sk-...)      → cloud API on api.xiaomimimo.com
 //   - Desktop account/OAuth → same cloud host, plus account-service models
-//     (Preview + mimo-auto/flash/pro) on mimo-server-<region>.xiaomimimo.com
+//     (Preview/subscription tiles: mimo-x-pro/flash-preview + mimo-auto/flash/pro,
+//     and the dual-route v2.6 trio) on mimo-server-<region>.xiaomimimo.com
 //     (authorized by a Xiaomi account session cookie, not the key).
 // Endpoint is picked per model in the executor, same as opencode-go's /responses split.
 // Region follows Desktop's apm-region.json / connection override (sgp default overseas).
@@ -31,6 +32,16 @@ export default {
   category: "oauth",
   authModes: ["oauth", "apikey"],
   hasOAuth: true,
+  // Keys are cluster-specific. MiMo Desktop declares five regions
+  // (CN/SGP/AMS/RU/IN) — host + sid follow mimo-server-<code> / mimo<code>.
+  regions: [
+    { id: "cn", label: "China (中国大陆)" },
+    { id: "sgp", label: "Singapore (新加坡)" },
+    { id: "ams", label: "Europe · Amsterdam (欧洲)" },
+    { id: "ru", label: "Russia (俄罗斯)" },
+    { id: "in", label: "India (印度)" },
+  ],
+  defaultRegion: "sgp",
   serviceKinds: ["llm", "tts"],
   transport: {
     baseUrl: "https://api.xiaomimimo.com/v1/chat/completions",
@@ -59,6 +70,10 @@ export default {
     { id: "mimo-auto", name: "MiMo Auto", supportedFormats: ["openai"] },
     { id: "mimo-flash", name: "MiMo Flash", supportedFormats: ["openai"] },
     { id: "mimo-pro", name: "MiMo Pro", supportedFormats: ["openai"] },
+    // Cloud API & Desktop dual-route models (prefers the desktop account quota when available)
+    { id: "mimo-v2.6-pro", name: "MiMo V2.6 Pro", upstreamModelId: "xiaomi/mimo-v2.6-pro", supportedFormats: ["openai"] },
+    { id: "mimo-v2.6-flash", name: "MiMo V2.6 Flash", upstreamModelId: "xiaomi/mimo-v2.6-flash", supportedFormats: ["openai"] },
+    { id: "mimo-v2.6-pro-ultraspeed", name: "MiMo V2.6 Pro UltraSpeed", upstreamModelId: "xiaomi/mimo-v2.6-pro-ultraspeed", supportedFormats: ["openai"] },
     // Cloud API models (api.xiaomimimo.com/v1)
     { id: "mimo-v2.5-pro", name: "MiMo V2.5 Pro" },
     { id: "mimo-v2.5", name: "MiMo V2.5" },

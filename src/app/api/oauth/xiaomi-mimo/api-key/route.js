@@ -13,7 +13,7 @@ import { createProviderConnection } from "@/models";
  */
 export async function POST(request) {
   try {
-    const {
+<    const {
       apiKey,
       uid,
       baseUrl,
@@ -21,11 +21,13 @@ export async function POST(request) {
       mimoUserId,
       mimoCUserId,
       mimoRegion,
+      region: bodyRegion,
     } = await request.json();
 
     const key = typeof apiKey === "string" ? apiKey.trim() : "";
     const hasKey = !!key;
     const hasSession = !!(typeof mimoPassToken === "string" && mimoPassToken.trim());
+    const sessionOnly = !hasKey && hasSession;
 
     if (!hasKey && !hasSession) {
       return NextResponse.json(
@@ -34,7 +36,7 @@ export async function POST(request) {
       );
     }
 
-    if (hasKey && !key.startsWith("sk-")) {
+<    if (hasKey && !key.startsWith("sk-")) {
       return NextResponse.json(
         { error: "Invalid key format — expected sk- prefix" },
         { status: 400 },
@@ -42,15 +44,19 @@ export async function POST(request) {
     }
 
     const effectiveBaseUrl = (baseUrl || "https://api.xiaomimimo.com/v1").replace(/\/+$/, "");
-    const region =
+    // Accept BOTH `mimoRegion` and `region` body fields (prefer mimoRegion, fallback region).
+    const regionRaw =
       typeof mimoRegion === "string" && mimoRegion.trim()
-        ? mimoRegion.trim().toLowerCase()
-        : null;
+        ? mimoRegion.trim()
+        : typeof bodyRegion === "string" && bodyRegion.trim()
+          ? bodyRegion.trim()
+          : null;
+    const region = regionRaw ? regionRaw.toLowerCase() : null;
 
     // Validate the key against the models endpoint (skipped for session-only)
     let validated = false;
     let modelCount = 0;
-    if (hasKey) {
+<    if (hasKey) {
       try {
         const resp = await fetch(`${effectiveBaseUrl}/models`, {
           method: "GET",
@@ -68,7 +74,7 @@ export async function POST(request) {
       } catch {
         // Network error — still allow import (key may be valid but network blocked)
       }
-    } else {
+<    } else {
       validated = true; // session-only: account route is the credential surface
     }
 
@@ -83,13 +89,16 @@ export async function POST(request) {
       mimoRegion: region,
     };
 
-    // Dedup: if a connection with the same uid or same key already exists, update it
+    // Dedup: same uid, same key, or same session identity+region
     const { getProviderConnections, updateProviderConnection } = await import("@/models");
+    const normRegion = (typeof region === "string" && region) || undefined;
     const existing = (await getProviderConnections()).find(
       (c) => c.provider === "xiaomi-mimo" && (
         (uid && c.email === `${uid}@xiaomi`) ||
         (hasKey && c.accessToken === key) ||
-        (hasSession && c.providerSpecificData?.mimoPassToken === mimoPassToken.trim())
+        (sessionOnly && mimoUserId &&
+          c.providerSpecificData?.mimoUserId === mimoUserId &&
+          (normRegion ? (c.providerSpecificData?.region || "cn") === normRegion : true))
       ),
     );
     if (existing) {
@@ -98,7 +107,9 @@ export async function POST(request) {
         providerSpecificData: {
           ...existing.providerSpecificData,
           uid: uid || existing.providerSpecificData?.uid || null,
-          baseUrl: effectiveBaseUrl,
+          baseUrl: key ? effectiveBaseUrl : (existing.providerSpecificData?.baseUrl || effectiveBaseUrl),
+          region: normRegion || existing.providerSpecificData?.region || "cn",
+          authMethod: sessionOnly ? "session" : (existing.providerSpecificData?.authMethod || "api_key"),
           // Per-account session credential — enables multi-account rotation.
           mimoPassToken: sessionFields.mimoPassToken || existing.providerSpecificData?.mimoPassToken || null,
           mimoUserId: sessionFields.mimoUserId || existing.providerSpecificData?.mimoUserId || null,
@@ -124,22 +135,26 @@ export async function POST(request) {
 
     const connection = await createProviderConnection({
       provider: "xiaomi-mimo",
-      authType: hasKey ? "api_key" : "oauth",
-      accessToken: hasKey ? key : null,
+      // "oauth" is the official authType for imported credential connections
+      // ([action]/route.js) — the list card and filters key off it; never
+      // invent new values ("session" hid the row from the provider card).
+      authType: sessionOnly ? "oauth" : "api_key",
+      accessToken: key || null,
       refreshToken: null,
       // API keys don't expire on a fixed schedule; use a long horizon
       expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
-      email: uid ? `${uid}@xiaomi` : mimoUserId ? `${mimoUserId}@xiaomi` : null,
+      email: uid ? `${uid}@xiaomi` : (mimoUserId ? `${mimoUserId}@xiaomi` : null),
       displayName: uid
-        ? `Xiaomi ${uid}`
+        ? `Xiaomi ${uid}${sessionOnly ? " (Session)" : ""}`
         : mimoUserId
-          ? `Xiaomi ${mimoUserId}`
+          ? `Xiaomi ${mimoUserId}${sessionOnly ? " (Session)" : ""}`
           : "Xiaomi MiMo",
       providerSpecificData: {
         uid: uid || mimoUserId || null,
         baseUrl: effectiveBaseUrl,
-        authMethod: hasKey ? "api_key" : "account_session",
-        provider: hasKey ? "API Key" : "Desktop Session",
+        authMethod: sessionOnly ? "session" : "api_key",
+        provider: sessionOnly ? "Session Login" : "API Key",
+        region: normRegion || "cn",
         modelCount,
         // Per-account session credential — enables multi-account rotation.
         mimoPassToken: sessionFields.mimoPassToken,
@@ -147,7 +162,7 @@ export async function POST(request) {
         mimoCUserId: sessionFields.mimoCUserId,
         mimoRegion: sessionFields.mimoRegion,
       },
-      testStatus: validated ? "active" : "untested",
+      testStatus: validated ? "active" : (sessionOnly ? "active" : "untested"),
     });
 
     return NextResponse.json({
