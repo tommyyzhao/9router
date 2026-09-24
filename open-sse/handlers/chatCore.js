@@ -38,6 +38,8 @@ import { resolveSessionId } from "../utils/sessionManager.js";
  * @param {object} options.body - Request body
  * @param {object} options.modelInfo - { provider, model }
  * @param {object} options.credentials - Provider credentials
+ * @param {AbortSignal} [options.clientSignal] - Inbound HTTP request signal; when the
+ *   client disconnects, upstream work is aborted instead of burning tokens unseen.
  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
  */
 /**
@@ -60,7 +62,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientSignal, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Drop client-only OpenAI extras (store/metadata) that strict OpenAI-compatible
@@ -350,7 +352,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       if (onDisconnect) onDisconnect(reason);
     },
     onError: () => trackPendingRequest(model, provider, connectionId, false),
-    log, provider, model, reqTag
+    log, provider, model, reqTag,
+    externalSignal: clientSignal || null,
   });
 
   const proxyOptions = {

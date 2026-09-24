@@ -7,6 +7,7 @@ export const HTTP_STATUS = {
   NOT_FOUND: 404,
   NOT_ACCEPTABLE: 406,
   REQUEST_TIMEOUT: 408,
+  PAYLOAD_TOO_LARGE: 413,
   RATE_LIMITED: 429,
   SERVER_ERROR: 500,
   BAD_GATEWAY: 502,
@@ -57,6 +58,17 @@ export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_M
 
 // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
 export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);
+
+// Ingress guard: refuse absurdly large chat request bodies before parsing.
+// Deliberately generous — a 700k-token conversation is only ~2-3MB of JSON,
+// so the 50MB default (≈20x headroom) only stops runaway/accidental payloads
+// from wedging the single Node event loop. Env: MAX_REQUEST_BODY_BYTES.
+export const MAX_REQUEST_BODY_BYTES = envMs("MAX_REQUEST_BODY_BYTES", 50 * 1024 * 1024);
+
+// Ingress guard: refuse absurd message arrays (same rationale — observed live
+// max is ~500 messages; 50000 is 100x headroom, never a real conversation).
+// Env: MAX_REQUEST_MESSAGES.
+export const MAX_REQUEST_MESSAGES = envMs("MAX_REQUEST_MESSAGES", 50000);
 
 // Gemini native TTS fetch timeout: abort if Google does not return response headers in time.
 export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS", 45 * 1000);

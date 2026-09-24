@@ -18,7 +18,7 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "open-sse/services/combo.js";
 import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
-import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
+import { HTTP_STATUS, MAX_REQUEST_BODY_BYTES, MAX_REQUEST_MESSAGES } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
@@ -31,12 +31,31 @@ import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
  * Format detection and translation handled by translator
  */
 export async function handleChat(request, clientRawRequest = null) {
+  // Ingress guard: refuse absurd bodies before parsing so one runaway payload
+  // can't wedge the event loop. Limits are deliberately generous (50MB /
+  // 50000 messages by default) — a 700k-token conversation is only ~2-3MB,
+  // so genuine traffic never trips this.
+  const contentLength = parseInt(request.headers.get("content-length") || "", 10);
+  if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BODY_BYTES) {
+    log.warn("CHAT", `Rejecting oversized body: ${contentLength} bytes (limit ${MAX_REQUEST_BODY_BYTES})`);
+    return errorResponse(HTTP_STATUS.PAYLOAD_TOO_LARGE, `Request body too large (${contentLength} bytes, limit ${MAX_REQUEST_BODY_BYTES})`);
+  }
   let body;
   try {
-    body = await request.json();
+    const rawText = await request.text();
+    if (rawText.length > MAX_REQUEST_BODY_BYTES) {
+      log.warn("CHAT", `Rejecting oversized body: ${rawText.length} bytes (limit ${MAX_REQUEST_BODY_BYTES})`);
+      return errorResponse(HTTP_STATUS.PAYLOAD_TOO_LARGE, `Request body too large (${rawText.length} bytes, limit ${MAX_REQUEST_BODY_BYTES})`);
+    }
+    body = JSON.parse(rawText);
   } catch {
     log.warn("CHAT", "Invalid JSON body");
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid JSON body");
+  }
+  const inboundMsgCount = body?.messages?.length || body?.input?.length || 0;
+  if (inboundMsgCount > MAX_REQUEST_MESSAGES) {
+    log.warn("CHAT", `Rejecting oversized message array: ${inboundMsgCount} (limit ${MAX_REQUEST_MESSAGES})`);
+    return errorResponse(HTTP_STATUS.PAYLOAD_TOO_LARGE, `Too many messages (${inboundMsgCount}, limit ${MAX_REQUEST_MESSAGES})`);
   }
 
   // Build clientRawRequest for logging (if not provided)
@@ -274,6 +293,9 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       connectionId: credentials.connectionId,
       userAgent,
       apiKey,
+      // Abort upstream work when the inbound client goes away (browser tab
+      // closed, CLI killed). Live requests are unaffected.
+      clientSignal: request?.signal || null,
       ccFilterNaming: !!chatSettings.ccFilterNaming,
       rtkEnabled: !!chatSettings.rtkEnabled,
       headroomEnabled: !!chatSettings.headroomEnabled,

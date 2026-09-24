@@ -1,5 +1,5 @@
 // Stream handler with disconnect detection - shared for all providers
-import { STREAM_STALL_TIMEOUT_MS } from "../config/runtimeConfig.js";
+import { STREAM_STALL_TIMEOUT_MS, STREAM_FIRST_CHUNK_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
 // Get HH:MM:SS timestamp
@@ -14,8 +14,11 @@ function getTimeString() {
  * @param {object} options.log - Logger instance
  * @param {string} options.provider - Provider name
  * @param {string} options.model - Model name
+ * @param {AbortSignal} [options.externalSignal] - Upstream signal (e.g. the
+ *   inbound HTTP request's signal) that also marks this request disconnected.
+ *   Only fires when the client is actually gone, so live requests are unaffected.
  */
-export function createStreamController({ onDisconnect, onError, log, provider, model, reqTag = "" } = {}) {
+export function createStreamController({ onDisconnect, onError, log, provider, model, reqTag = "", externalSignal = null } = {}) {
   const abortController = new AbortController();
   const startTime = Date.now();
   let disconnected = false;
@@ -30,7 +33,7 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
     else console.log(`[${getTimeString()}] ${symbol} ${provider}/${model} · ${status} · ${duration}ms`);
   };
 
-  return {
+  const controller = {
     signal: abortController.signal,
     startTime,
 
@@ -85,6 +88,16 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
 
     abort: () => abortController.abort()
   };
+
+  // An already-gone (or later-aborted) inbound client must stop burning
+  // upstream work. Live clients never trigger this, so live requests are
+  // unaffected. Guarded — a foreign signal must never throw into the request.
+  try {
+    if (externalSignal?.aborted) controller.handleDisconnect("client_aborted");
+    else externalSignal?.addEventListener?.("abort", () => controller.handleDisconnect("client_aborted"), { once: true });
+  } catch { /* external signal is best-effort */ }
+
+  return controller;
 }
 
 /**
@@ -188,18 +201,33 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * Any upstream chunk resets the timer. If no bytes arrive for
  * STREAM_STALL_TIMEOUT_MS, abort the underlying fetch via the controller.
  *
+ * A separate time-to-first-token watchdog aborts when the upstream accepts
+ * the request but never starts answering (headers arrived, zero bytes).
+ * Default 200s — legitimate 30s+ prefills on 700k-token prompts are
+ * unaffected; only a truly wedged upstream trips it. There is deliberately
+ * NO total-stream ceiling: once tokens flow, a stream may run as long as
+ * chunks keep arriving inside the stall window.
+ *
  * @param {Response} providerResponse - Response from provider
  * @param {TransformStream} transformStream - Transform stream for SSE
  * @param {object} streamController - Stream controller from createStreamController
+ * @param {function} [onAbortTerminal] - Terminal-bytes builder
+ * @param {number} [stallTimeoutMs] - Inter-chunk stall budget
+ * @param {number} [firstChunkTimeoutMs] - Time-to-first-byte budget
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, firstChunkTimeoutMs = STREAM_FIRST_CHUNK_TIMEOUT_MS) {
   let stallTimer = null;
+  let firstChunkTimer = null;
   let chunkCount = 0;
   let totalBytes = 0;
   let lastChunkAt = Date.now();
   let abortMessage = "upstream connection lost";
   const t0 = Date.now();
   const tag = "STREAM";
+  const clearTimers = () => {
+    if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+    if (firstChunkTimer) { clearTimeout(firstChunkTimer); firstChunkTimer = null; }
+  };
   const clearStall = () => {
     if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
   };
@@ -214,25 +242,33 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     }, stallTimeoutMs);
   };
 
-  // Wrap controller so every termination path clears the stall timer.
-  // Without this, abort/cancel/downstream-error paths leave the timer armed
+  // Wrap controller so every termination path clears all timers.
+  // Without this, abort/cancel/downstream-error paths leave timers armed
   // and a stale abort could fire after the request has already ended.
   const wrappedController = {
     signal: streamController.signal,
     startTime: streamController.startTime,
     isConnected: () => streamController.isConnected(),
-    handleComplete: () => { dbg(tag, `complete | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleComplete(); },
-    handleError: (e) => { dbg(tag, `error: ${e?.message} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleError(e); },
-    handleDisconnect: (r) => { dbg(tag, `disconnect: ${r} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); streamController.handleDisconnect(r); },
-    abort: () => { clearStall(); streamController.abort(); }
+    handleComplete: () => { dbg(tag, `complete | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearTimers(); streamController.handleComplete(); },
+    handleError: (e) => { dbg(tag, `error: ${e?.message} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearTimers(); streamController.handleError(e); },
+    handleDisconnect: (r) => { dbg(tag, `disconnect: ${r} | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearTimers(); streamController.handleDisconnect(r); },
+    abort: () => { clearTimers(); streamController.abort(); }
   };
 
   armStall();
-  dbg(tag, `pipe start | stallTimeout=${stallTimeoutMs}ms`);
+  firstChunkTimer = setTimeout(() => {
+    firstChunkTimer = null;
+    abortMessage = "time-to-first-token timeout";
+    dbg(tag, `TTFT TIMEOUT ${firstChunkTimeoutMs}ms | chunks=${chunkCount} | bytes=${totalBytes}`);
+    streamController.handleError?.(new Error("time-to-first-token timeout"));
+    streamController.abort?.();
+  }, firstChunkTimeoutMs);
+  dbg(tag, `pipe start | stallTimeout=${stallTimeoutMs}ms | ttftTimeout=${firstChunkTimeoutMs}ms`);
 
   const upstreamTap = new TransformStream({
     transform(chunk, controller) {
       chunkCount++;
+      if (firstChunkTimer) { clearTimeout(firstChunkTimer); firstChunkTimer = null; }
       const sz = chunk?.byteLength || chunk?.length || 0;
       totalBytes += sz;
       const now = Date.now();
@@ -244,7 +280,7 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
       armStall();
       controller.enqueue(chunk);
     },
-    flush() { dbg(tag, `upstream EOF | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearStall(); }
+    flush() { dbg(tag, `upstream EOF | chunks=${chunkCount} | bytes=${totalBytes} | dur=${Date.now() - t0}ms`); clearTimers(); }
   });
 
   const transformedBody = providerResponse.body
