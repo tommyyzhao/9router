@@ -20,6 +20,10 @@ import { openAICompletionToClaudeMessage } from "./responseConverters.js";
  * path already emits Responses events, but the JSON path returned a raw
  * `chat.completion` body, so tool_calls were invisible to Responses clients.
  */
+function isClaudeMessage(body) {
+  return body?.type === "message" && Array.isArray(body?.content);
+}
+
 function extractCustomToolInput(argumentsValue) {
   const argumentsText = typeof argumentsValue === "string" ? argumentsValue : JSON.stringify(argumentsValue || {});
   try {
@@ -245,6 +249,14 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
       appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid SSE response for non-streaming request");
     }
+    if (parsed.error) {
+      const upstreamStatus = Number(parsed.error.status);
+      const status = Number.isInteger(upstreamStatus) && upstreamStatus >= 400 && upstreamStatus <= 599
+        ? upstreamStatus
+        : HTTP_STATUS.BAD_GATEWAY;
+      appendLog({ status: `FAILED ${status}` });
+      return createErrorResult(status, parsed.error.message || "Upstream SSE stream failed");
+    }
     responseBody = parsed;
   } else {
     try {
@@ -326,6 +338,11 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   }
 
   reqLogger.logConvertedResponse(translatedResponse);
+
+  if (sourceFormat === FORMATS.CLAUDE && !isClaudeMessage(translatedResponse)) {
+    appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });
+    return createErrorResult(HTTP_STATUS.BAD_GATEWAY, "Invalid Claude message response from upstream");
+  }
 
   const totalLatency = Date.now() - requestStartTime;
   saveRequestDetail(buildRequestDetail({

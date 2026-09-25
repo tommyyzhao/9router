@@ -7,7 +7,7 @@ vi.mock("@/lib/usageDb.js", () => ({
 }));
 
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
-const { translateNonStreamingResponse } = await import("../../open-sse/handlers/chatCore/nonStreamingHandler.js");
+const { handleNonStreamingResponse, translateNonStreamingResponse } = await import("../../open-sse/handlers/chatCore/nonStreamingHandler.js");
 const { handleForcedSSEToJson } = await import("../../open-sse/handlers/chatCore/sseToJsonHandler.js");
 
 // A chat.completion body as returned by a chat-native upstream (e.g. op-ericding)
@@ -82,6 +82,66 @@ describe("non-stream Chat upstream for a Responses-API client (op-ericding bug)"
     const out = translateNonStreamingResponse(CHAT_TOOL_BODY, FORMATS.OPENAI, FORMATS.OPENAI);
     expect(out.object).toBe("chat.completion");
     expect(out.choices[0].message.tool_calls[0].function.name).toBe("shell");
+  });
+});
+
+describe("claude non-streaming 200-guard", () => {
+  const baseCtx = (providerResponse, sourceFormat = FORMATS.CLAUDE, targetFormat = FORMATS.OPENAI) => ({
+    providerResponse,
+    provider: "test-provider",
+    model: "test-model",
+    sourceFormat,
+    targetFormat,
+    body: { model: "test-model", messages: [] },
+    stream: false,
+    requestStartTime: Date.now(),
+    connectionId: "test-connection",
+    apiKey: "test-key",
+    clientRawRequest: { endpoint: "/v1/messages" },
+    trackDone: vi.fn(),
+    appendLog: vi.fn(),
+    reqLogger: { logProviderResponse: vi.fn(), logConvertedResponse: vi.fn() },
+  });
+
+  it("turns a passthrough bad body into 502 for a Claude client", async () => {
+    const result = await handleNonStreamingResponse(baseCtx(
+      new Response(JSON.stringify({ foo: "bar" }), { headers: { "content-type": "application/json" } })
+    ));
+    expect(result.success).toBe(false);
+    expect(result.response.status).toBe(502);
+    expect(await result.response.json()).toHaveProperty("error");
+  });
+
+  it("keeps a valid Claude Message at 200", async () => {
+    const payload = {
+      id: "chatcmpl-guard-ok",
+      object: "chat.completion",
+      created: 1700000000,
+      model: "test-model",
+      choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    };
+    const result = await handleNonStreamingResponse(baseCtx(
+      new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } })
+    ));
+    expect(result.success).toBe(true);
+    const json = await result.response.json();
+    expect(json.type).toBe("message");
+    expect(json.content).toEqual([{ type: "text", text: "hi" }]);
+  });
+
+  it("surfaces an SSE error payload as 502 instead of 200", async () => {
+    const raw = [
+      'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}',
+      'data: {"error":{"message":"boom"}}',
+      "data: [DONE]",
+      ""
+    ].join("\n\n");
+    const result = await handleNonStreamingResponse(baseCtx(
+      new Response(raw, { headers: { "content-type": "text/event-stream" } })
+    ));
+    expect(result.success).toBe(false);
+    expect(result.response.status).toBe(502);
   });
 });
 
