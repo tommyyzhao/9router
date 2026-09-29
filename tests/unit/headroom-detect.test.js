@@ -15,6 +15,15 @@ vi.mock("child_process", () => ({
   execFileSync: mocks.execFileSync,
 }));
 
+const realpathSync = vi.hoisted(() => vi.fn((p) => p));
+vi.mock("fs", async (orig) => {
+  const actual = await orig();
+  return { ...actual, default: { ...actual, realpathSync }, realpathSync };
+});
+
+const isShow = (args) => args[0] === "-c" && args[1].includes("m.version('headroom-ai')");
+const isList = (args) => args[0] === "-c" && args[1].includes("m.distributions()");
+
 import { findPython310, getHeadroomStatus, getInstalledHeadroomExtras, isLoopbackHeadroomUrl } from "../../src/lib/headroom/detect.js";
 
 afterEach(() => {
@@ -22,12 +31,12 @@ afterEach(() => {
 });
 
 describe("headroom detect", () => {
-  it("detects installed headroom version and extras from pip list", () => {
+  it("detects installed headroom version and extras via importlib.metadata", () => {
     const result = getInstalledHeadroomExtras("python3");
 
     expect(mocks.execFileSync).toHaveBeenCalledWith(
       "python3",
-      ["-m", "pip", "list", "--format=json", "--disable-pip-version-check"],
+      ["-c", expect.stringContaining("m.distributions()")],
       expect.objectContaining({ windowsHide: true, timeout: 8000 }),
     );
     expect(result).toEqual({
@@ -46,7 +55,7 @@ describe("headroom detect", () => {
       throw new Error("unexpected execSync");
     });
     mocks.execFileSync.mockImplementation((py, args) => {
-      if (args.join(" ") === "-m pip show headroom-ai") {
+      if (isShow(args)) {
         if (py === binPython) return Buffer.from("Name: headroom-ai\nVersion: 0.26.0\n");
         throw new Error(`not installed in ${py}`);
       }
@@ -54,6 +63,24 @@ describe("headroom detect", () => {
     });
 
     expect(findPython310()).toBe(binPython);
+  });
+
+  it("follows a symlinked headroom binary into its pip-less tool venv", () => {
+    // uv tool install: ~/.local/bin/headroom -> ~/.local/share/uv/tools/headroom-ai/bin/headroom
+    const venvPython = "/uv/tools/headroom-ai/bin/python3";
+    realpathSync.mockImplementation((p) => (p === "/home/u/.local/bin/headroom" ? "/uv/tools/headroom-ai/bin/headroom" : p));
+    mocks.execSync.mockImplementation((cmd) => {
+      if (String(cmd).includes("where") || String(cmd).includes("which")) return Buffer.from("/home/u/.local/bin/headroom\n");
+      if (String(cmd).includes("--version")) return Buffer.from("Python 3.13.0\n");
+      throw new Error("unexpected execSync");
+    });
+    mocks.execFileSync.mockImplementation((py, args) => {
+      if (py === venvPython && isShow(args)) return Buffer.from("");
+      throw new Error(`no headroom-ai in ${py}`);
+    });
+
+    expect(findPython310()).toBe(venvPython);
+    realpathSync.mockImplementation((p) => p);
   });
 
   it("keeps top-level installed flag true when extras are readable", async () => {
@@ -65,9 +92,9 @@ describe("headroom detect", () => {
       throw new Error("unexpected execSync");
     });
     mocks.execFileSync.mockImplementation((py, args) => {
-      if (py === "python3" && args.join(" ") === "-m pip show headroom-ai") throw new Error("not installed in python3");
-      if (py === "python" && args.join(" ") === "-m pip show headroom-ai") return Buffer.from("Name: headroom-ai\nVersion: 0.26.0\n");
-      if (py === "python" && args.join(" ").startsWith("-m pip list ")) return Buffer.from(JSON.stringify([
+      if (py === "python3" && isShow(args)) throw new Error("not installed in python3");
+      if (py === "python" && isShow(args)) return Buffer.from("Name: headroom-ai\nVersion: 0.26.0\n");
+      if (py === "python" && isList(args)) return Buffer.from(JSON.stringify([
         { name: "headroom-ai", version: "0.26.0" },
         { name: "tree-sitter", version: "0.25.0" },
       ]));

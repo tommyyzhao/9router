@@ -1,4 +1,5 @@
 import { execFileSync, execSync } from "child_process";
+import fs from "fs";
 import path from "path";
 
 // Extras that improve headroom compression quality. `proxy` is the base;
@@ -7,7 +8,7 @@ import path from "path";
 // useful for the 9router proxy use case, so we don't track them here.
 export const HEADROOM_COMPRESSION_EXTRAS = ["code", "ml"];
 
-// Marker packages that each extra pulls in. Detected from `pip list --format=json`
+// Marker packages that each extra pulls in. Detected from one importlib.metadata listing
 // so one call can answer both the installed version and active extras.
 export const EXTRA_MARKERS = {
   code: ["tree-sitter", "tree-sitter-language-pack"],
@@ -15,6 +16,12 @@ export const EXTRA_MARKERS = {
 };
 
 const HEADROOM_PIP_TIMEOUT_MS = 8000;
+
+// Lists installed distributions as pip-list-shaped JSON via stdlib importlib.metadata,
+// so it also works in pip-less venvs (e.g. `uv tool install headroom-ai`).
+const LIST_DISTRIBUTIONS_PY =
+  "import json,importlib.metadata as m;print(json.dumps([{'name':d.metadata['Name'],'version':d.version} for d in m.distributions()]))";
+const HAS_HEADROOM_PY = "import importlib.metadata as m;m.version('headroom-ai')";
 
 const IS_WIN = process.platform === "win32";
 const WHICH_CMD = IS_WIN ? "where" : "which";
@@ -76,7 +83,10 @@ function pythonCandidates() {
   const list = [];
   const bin = findHeadroomBinary();
   if (bin) {
-    const dir = path.dirname(bin);
+    // Follow symlinks (uv/pipx link ~/.local/bin/headroom into the tool venv's bin).
+    let real = bin;
+    try { real = fs.realpathSync(bin); } catch { /* keep unresolved path */ }
+    const dir = path.dirname(real);
     const names = IS_WIN ? ["python.exe", "python3.exe"] : ["python3", "python3.13", "python"];
     for (const n of names) list.push(path.join(dir, n));
   }
@@ -103,7 +113,7 @@ export function findPython310() {
       if (!(major > MIN_VERSION[0] || (major === MIN_VERSION[0] && minor >= MIN_VERSION[1]))) continue;
       if (!fallback) fallback = candidate;
       try {
-        execFileSync(candidate, ["-m", "pip", "show", "headroom-ai"], {
+        execFileSync(candidate, ["-c", HAS_HEADROOM_PY], {
           stdio: ["ignore", "pipe", "ignore"],
           windowsHide: true,
           timeout: HEADROOM_PIP_TIMEOUT_MS,
@@ -162,15 +172,15 @@ export async function getHeadroomStatus(url) {
 }
 
 // Parse installed headroom-ai version + which compression extras are
-// actually installed (detected via marker package presence). One `pip list`
-// call is enough to answer both questions.
+// actually installed (detected via marker package presence). One distribution
+// listing is enough to answer both questions.
 //
 // Returns: { installed: bool, version: string|null, extras: { code, ml } }
 export function getInstalledHeadroomExtras(python) {
   const py = python || findPython310();
   if (!py) return { installed: false, version: null, extras: { code: false, ml: false } };
   try {
-    const out = execFileSync(py, ["-m", "pip", "list", "--format=json", "--disable-pip-version-check"], {
+    const out = execFileSync(py, ["-c", LIST_DISTRIBUTIONS_PY], {
       stdio: ["ignore", "pipe", "ignore"],
       windowsHide: true,
       timeout: HEADROOM_PIP_TIMEOUT_MS,
