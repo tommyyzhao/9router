@@ -13,7 +13,7 @@ import { createProviderConnection } from "@/models";
  */
 export async function POST(request) {
   try {
-<    const {
+    const {
       apiKey,
       uid,
       baseUrl,
@@ -36,7 +36,7 @@ export async function POST(request) {
       );
     }
 
-<    if (hasKey && !key.startsWith("sk-")) {
+    if (hasKey && !key.startsWith("sk-")) {
       return NextResponse.json(
         { error: "Invalid key format — expected sk- prefix" },
         { status: 400 },
@@ -56,7 +56,7 @@ export async function POST(request) {
     // Validate the key against the models endpoint (skipped for session-only)
     let validated = false;
     let modelCount = 0;
-<    if (hasKey) {
+    if (hasKey) {
       try {
         const resp = await fetch(`${effectiveBaseUrl}/models`, {
           method: "GET",
@@ -74,7 +74,7 @@ export async function POST(request) {
       } catch {
         // Network error — still allow import (key may be valid but network blocked)
       }
-<    } else {
+    } else {
       validated = true; // session-only: account route is the credential surface
     }
 
