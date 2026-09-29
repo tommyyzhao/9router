@@ -1130,5 +1130,33 @@
         }
       }
     ]
+  },
+  "dahl": {
+    "baseUrl": "https://inference.dahl.global/v1/chat/completions",
+    "validateUrl": "https://inference.dahl.global/v1/models",
+    "format": "openai"
+  },
+  "atria": {
+    "baseUrl": "https://api.atria-asi.ai/v1/chat/completions",
+    "validateUrl": "https://api.atria-asi.ai/v1/models",
+    "format": "openai"
+  },
+  "agnes": {
+    "baseUrl": "https://apihub.agnes-ai.com/v1/chat/completions",
+    "validateUrl": "https://apihub.agnes-ai.com/v1/models",
+    "format": "openai"
+  },
+  "bai": {
+    "baseUrl": "https://api.b.ai/v1/chat/completions",
+    "validateUrl": "https://api.b.ai/v1/models",
+    "format": "openai"
+  },
+  "tokenharbor": {
+    "baseUrl": "https://tokenharbor.ai/v1/chat/completions",
+    "validateUrl": "https://tokenharbor.ai/v1/models",
+    "retry": {
+      "429": 2
+    },
+    "format": "openai"
   }
 }

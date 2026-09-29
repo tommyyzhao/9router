@@ -125,9 +125,14 @@ import p119 from "./selfhosted-embedding.js";
 import p120 from "./fish-audio.js";
 import p121 from "./alitp-intl.js";
 import p122 from "./xquik.js";
-import p127 from "./meta.js";
-import p125 from "./parallel.js";
-import p126 from "./muse-desktop.js";
+import p125 from "./tokenharbor.js";
+import p126 from "./dahl.js";
+import p127 from "./atria.js";
+import p128 from "./parallel.js";
+import p129 from "./agnes.js";
+import p130 from "./bai.js";
+import p131 from "./meta.js";
+import p132 from "./muse-desktop.js";
 export default [
   p0,
   p1,
@@ -254,7 +259,12 @@ export default [
   p121,
   p122,
   // p123 lives mid-list (ollama-search) — do not re-append here
-  p127,
   p125,
   p126,
+  p127,
+  p128,
+  p129,
+  p130,
+  p131,
+  p132,
 ];
