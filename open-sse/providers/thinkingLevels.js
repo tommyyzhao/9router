@@ -10,8 +10,8 @@ const L = {
   base: ["none", "low", "medium", "high"],                          // qwen, step, hunyuan, gemini-budget
   onOff: ["none", "thinking"],                                      // zai (binary), minimax (adaptive)
   openai: ["none", "minimal", "low", "medium", "high", "xhigh"],    // GPT-5.x / o-series (no "max")
-  levelMax: ["none", "low", "medium", "high", "max"],               // claude-adaptive, kimi
-  budgetX: ["none", "low", "medium", "high", "xhigh", "max"],       // claude-budget
+  levelMax: ["none", "low", "medium", "high", "max"],               // kimi, Claude 4.6 adaptive (no xhigh)
+  budgetX: ["none", "low", "medium", "high", "xhigh", "max"],       // claude-budget, claude-adaptive (Opus 4.7+, Sonnet 5+, Fable)
   gemini: ["minimal", "low", "medium", "high"],                     // gemini-3 thinkingLevel (no disable)
   hiMax: ["none", "high", "max"],                                   // deepseek (low/med→high, xhigh→max)
 };
@@ -19,7 +19,7 @@ const L = {
 // thinkingFormat → valid selectable levels (source of truth for UI options).
 const FORMAT_LEVELS = {
   openai: L.openai,
-  "claude-adaptive": L.levelMax,
+  "claude-adaptive": L.budgetX,
   "claude-budget": L.budgetX,
   "gemini-level": L.gemini,
   "gemini-budget": L.base,
@@ -42,6 +42,10 @@ const PATTERN_THINKING = [
   { provider: "codex", pattern: "*gpt-5.6-sol*", levels: [...CODEX_GPT_5_6_LEVELS, "ultra"] },
   { provider: "codex", pattern: "*gpt-5.6-terra*", levels: [...CODEX_GPT_5_6_LEVELS, "ultra"] },
   { provider: "codex", pattern: "*gpt-5.6-luna*", levels: CODEX_GPT_5_6_LEVELS },
+  // Claude 4.6 effort is low|medium|high|max — xhigh arrived with Opus 4.7.
+  // claude-adaptive writer clamps xhigh→high when the resolved set lacks it.
+  { pattern: "*claude*-4.6*", levels: L.levelMax },
+  { pattern: "*claude*-4-6*", levels: L.levelMax },
   { pattern: "*codex*", levels: ["low", "medium", "high", "xhigh"] }, // codex cannot disable thinking
   { pattern: "*mimo*v2.6*", levels: ["none", "low", "medium", "high", "xhigh"] },
   // mimo-v2.5-pro on opencode-go rejects reasoning_effort "max" (probed live); v2.5 accepts it.

@@ -168,6 +168,15 @@ function normalizeOpenAILevel(level, supportedLevels) {
   return "xhigh";
 }
 
+// Claude effort enum is low|medium|high|xhigh|max. auto → high (#3792); minimal
+// (the can't-disable clamp) → low; xhigh → high only where the model's level set lacks it (4.6).
+function toClaudeEffort(level, supportedLevels) {
+  if (level === "auto") return "high";
+  if (level === "minimal") return "low";
+  if (level === "xhigh" && !supportedLevels?.includes("xhigh")) return "high";
+  return level;
+}
+
 function toGeminiThinkingLevel(cfg) {
   const raw = cfg.mode === "auto" ? "high" : (toLevel(cfg) || "high");
   return effortToThinkingLevel(raw);
@@ -265,13 +274,13 @@ function applyFormat(fmt, body, cfg, caps, supportedLevels, display) {
       break;
     }
     case "claude-adaptive": {
-      if (none && canDisable) { body.thinking = { type: "disabled" }; break; }
+      // Off switch comes from caps (Sonnet 5.5 rejects "disabled", wants a bare "between_tools").
+      if (none && canDisable) { body.thinking = { type: caps.thinkingDisableMode || "disabled" }; break; }
       // Models that can disable thinking need the explicit adaptive switch.
       // Permanently adaptive models such as Fable 5.1 accept effort directly.
       if (canDisable) body.thinking = { type: "adaptive", ...(display ? { display } : {}) };
       else delete body.thinking;
-      const level = toLevel(eff);
-      body.output_config = { effort: level === "xhigh" || level === "auto" ? "high" : level };
+      body.output_config = { effort: toClaudeEffort(toLevel(eff), supportedLevels) };
       break;
     }
     case "claude-budget": {

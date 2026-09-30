@@ -97,6 +97,44 @@ describe("applyThinking per provider format", () => {
     expect(out.output_config).toEqual({ effort: "high" });
     expect(out.thinking).toBeUndefined();
   });
+  it("Opus 5.5 (xhigh) → effort xhigh, no thinking switch (cannot disable)", () => {
+    const out = apply("claude", "claude-opus-5-5(xhigh)", {}, "claude");
+    expect(out.output_config).toEqual({ effort: "xhigh" });
+    expect(out.thinking).toBeUndefined();
+  });
+  it("Opus 5.5 (none) → lowest effort, never thinking.disabled", () => {
+    const out = apply("claude", "claude-opus-5-5(none)", {}, "claude");
+    expect(out.output_config).toEqual({ effort: "low" });
+    expect(out.thinking).toBeUndefined();
+  });
+  it("Fable 5.1 (xhigh) → effort xhigh", () => {
+    const out = apply("claude", "claude-fable-5-1(xhigh)", {}, "claude");
+    expect(out.output_config).toEqual({ effort: "xhigh" });
+    expect(out.thinking).toBeUndefined();
+  });
+  it("Opus 4.7 xhigh passes through", () => {
+    const out = apply("claude", "claude-opus-4-7", { reasoning_effort: "xhigh" }, "claude");
+    expect(out.output_config).toEqual({ effort: "xhigh" });
+  });
+  it("Opus 4.6 (xhigh) → high (4.6 has no xhigh)", () => {
+    const out = apply("claude", "claude-opus-4-6(xhigh)", {}, "claude");
+    expect(out.output_config).toEqual({ effort: "high" });
+    expect(out.thinking).toEqual({ type: "adaptive" });
+  });
+  it("Sonnet 5.5 (high) → adaptive + effort high, no budget_tokens", () => {
+    const out = apply("claude", "claude-sonnet-5-5(high)", {}, "claude");
+    expect(out.thinking).toEqual({ type: "adaptive" });
+    expect(out.output_config).toEqual({ effort: "high" });
+  });
+  it("Sonnet 5.5 (none) → bare between_tools, no effort", () => {
+    const out = apply("claude", "claude-sonnet-5-5(none)", {}, "claude");
+    expect(out.thinking).toEqual({ type: "between_tools" });
+    expect(out.output_config).toBeUndefined();
+  });
+  it("Sonnet 5 (none) still → disabled", () => {
+    const out = apply("claude", "claude-sonnet-5(none)", {}, "claude");
+    expect(out.thinking).toEqual({ type: "disabled" });
+  });
   it("claude haiku → enabled+budget", () => {
     const out = apply("claude", "claude-haiku-4.5", { reasoning_effort: "high" }, "claude");
     expect(out.thinking).toEqual({ type: "enabled", budget_tokens: 24576 });

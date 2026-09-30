@@ -57,6 +57,7 @@ export const DEFAULT_CAPABILITIES = {
   // enum: openai|claude-adaptive|claude-budget|gemini-level|gemini-budget|zai|qwen|deepseek|kimi|minimax|hunyuan|step|meta
   thinkingFormat: null,
   thinkingCanDisable: true,  // false → model cannot turn thinking off (clamp to min instead of disable)
+  thinkingDisableMode: null, // claude-adaptive: thinking.type sent for "none" (null → "disabled"; Sonnet 5.5 → "between_tools")
   thinkingRange: null,       // { min, max } for budget formats; null = no clamp
   thinkingEffortSupported: false, // zai format only: model accepts a reasoning_effort level (GLM-5.2+; older GLM ignores it)
   // limits (tokens)
@@ -85,6 +86,12 @@ export function capabilitiesFromServiceKind(kind) {
  */
 export const MODEL_CAPABILITIES = {
   // Claude Fable 5.1, Opus 5, 4.6/4.7/4.8, and Kiro Sonnet 5 have 1M context + adaptive thinking (override generic claude pattern)
+  // Opus 5.5 rejects thinking.disabled at every effort; Sonnet 5.5 rejects disabled and
+  // turns thinking off via {type:"between_tools"} (effort ≤ high — "none" sends no effort).
+  "claude-opus-5-5":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 128000 },
+  "claude-opus-5.5":   { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 128000 },
+  "claude-sonnet-5-5": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", thinkingDisableMode: "between_tools", contextWindow: 1000000, maxOutput: 128000 },
+  "claude-sonnet-5.5": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", thinkingDisableMode: "between_tools", contextWindow: 1000000, maxOutput: 128000 },
   "claude-fable-5-1": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", thinkingCanDisable: false, contextWindow: 1000000, maxOutput: 128000 },
   "claude-opus-5":     { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
   "claude-opus-5-thinking": { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
