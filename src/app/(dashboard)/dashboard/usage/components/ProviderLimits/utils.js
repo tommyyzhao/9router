@@ -701,8 +701,9 @@ export function parseQuotaData(provider, data) {
         }
         break;
 
+      case "clinepass":
       case "ollama":
-        // Session (5h) / Weekly (7d) / Monthly usage % from ollama.com/api/usage.
+        // Session (5h) / Weekly (7d) / Monthly usage %.
         // remainingPercentage only — no absolute remaining (UI treats remaining as %).
         if (data.quotas) {
           Object.entries(data.quotas).forEach(([name, quota]) => {
