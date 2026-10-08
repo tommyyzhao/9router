@@ -14,6 +14,7 @@
 - **Dashboard**: open 9Remote sidebar item directly to website
 
 ## Fixes
+- **ClinePass**: read the live model catalog from Cline's recommended-models feed and refresh the static fallback (removes 4 retired ids that returned 404)
 - **Dashboard**: fix mobile layouts for API Keys card (alignment, code wrap), header breadcrumbs (overflow collision), model chips (full width, break-all), and Claude CLI settings
 - **Gemini**: do not treat properties map as schema node when tool parameter is named `properties` (#4620); rename `$ref` keys in `functionResponse` payloads
 - **Translator**: uniquify duplicate `tool_call_ids` for Gemini (#4532)
